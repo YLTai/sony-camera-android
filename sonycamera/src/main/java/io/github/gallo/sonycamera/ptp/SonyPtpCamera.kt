@@ -515,62 +515,54 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      */
     data class FocusAreaProbe(
         val focusAreaCode: Int?,
+        val afAreaPositionRaw: Int?,
         val debug: String
     )
 
+    private data class PropertyBlobHit(
+        val offset: Int,
+        val dataType: Int,
+        val standardValue: Int?,
+        val sonyFlaggedValue: Int?,
+        val bytes: String
+    )
+
     /**
-     * Probe Sony Focus Area (0xD22C) with diagnostics.
-     *
-     * First try Sony GetDevicePropertyValue (0x9204), which avoids depending
-     * on the generation-specific layout of the 0x9209 aggregate property blob.
-     * Older bodies/firmware may reject 0x9204 for this property, so we then
-     * scan 0x9209 and test both standard PTP and Sony's extra-flag layout.
+     * Probe focus-area information with diagnostics for both older and newer
+     * Sony bodies. ILCE-7CM2 (A7C II) is newer than the original A6600 target,
+     * so we explicitly inspect both Focus Area (0xD22C) and AF Area Position
+     * (0xD2DC). We report raw position bits only; we do not label low/high
+     * halves as X/Y until the real camera confirms the encoding.
      */
     fun probeFocusArea(): FocusAreaProbe {
-        val knownValues = setOf(
+        val knownAreaValues = setOf(
             0x0001, 0x0002, 0x0003,
             0x0101, 0x0102, 0x0103, 0x0104,
-            0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207
+            0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207,
+            0x0105, 0x0106, 0x0107, 0x0108,
+            0x1101, 0x1102, 0x1103,
+            0x1201, 0x1202, 0x1203
         )
 
-        // Fast/direct path. sendCommandWithData strips the PTP container, so
-        // response.data is the property payload itself.
-        val direct = transport.sendCommandWithData(
-            PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
-            PtpConstants.PROP_SONY_FOCUS_AREA
-        )
-        val directValue = when {
-            direct.data.size >= 2 -> ByteBuffer.wrap(direct.data, 0, 2)
+        fun parseDirectValue(data: ByteArray): Int? = when {
+            data.size >= 4 -> ByteBuffer.wrap(data, 0, 4)
+                .order(ByteOrder.LITTLE_ENDIAN).int
+            data.size >= 2 -> ByteBuffer.wrap(data, 0, 2)
                 .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-            direct.data.size == 1 -> direct.data[0].toInt() and 0xFF
+            data.size == 1 -> data[0].toInt() and 0xFF
             else -> null
         }
-        val directSummary = "9204=${PtpConstants.responseCodeName(direct.responseCode)} " +
-            "${direct.dataSize}B value=${directValue?.let { "0x%04X".format(it) } ?: "n/a"}"
 
-        if (direct.isSuccess && directValue in knownValues) {
-            return FocusAreaProbe(directValue, directSummary).also {
-                Log.d(TAG, "AF probe: ${it.debug}")
-            }
+        fun valueSize(dataType: Int): Int = when (dataType) {
+            1, 2 -> 1
+            3, 4 -> 2
+            5, 6 -> 4
+            7, 8 -> 8
+            else -> 0
         }
 
-        // Fallback for Sony generation-2 bodies: inspect the aggregate blob.
-        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
-        if (!all.isSuccess || all.data.size < 8) {
-            val result = FocusAreaProbe(
-                null,
-                "$directSummary; 9209=${PtpConstants.responseCodeName(all.responseCode)} ${all.dataSize}B"
-            )
-            Log.d(TAG, "AF probe: ${result.debug}")
-            return result
-        }
-
-        val data = all.data
-        val hits = mutableListOf<String>()
-        var selected: Int? = null
-
-        fun readValue(offset: Int, size: Int): Int? {
-            if (offset < 0 || offset + size > data.size) return null
+        fun readValue(data: ByteArray, offset: Int, size: Int): Int? {
+            if (offset < 0 || size !in 1..4 || offset + size > data.size) return null
             return when (size) {
                 1 -> data[offset].toInt() and 0xFF
                 2 -> ByteBuffer.wrap(data, offset, 2)
@@ -581,51 +573,116 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             }
         }
 
-        for (offset in 0 until data.size - 4) {
-            val code = (data[offset].toInt() and 0xFF) or
-                ((data[offset + 1].toInt() and 0xFF) shl 8)
-            if (code != PtpConstants.PROP_SONY_FOCUS_AREA) continue
+        fun findBlobHit(data: ByteArray, propertyCode: Int): PropertyBlobHit? {
+            for (offset in 0 until data.size - 4) {
+                val code = (data[offset].toInt() and 0xFF) or
+                    ((data[offset + 1].toInt() and 0xFF) shl 8)
+                if (code != propertyCode) continue
 
-            val dataType = (data[offset + 2].toInt() and 0xFF) or
-                ((data[offset + 3].toInt() and 0xFF) shl 8)
-            val valueSize = when (dataType) {
-                1, 2 -> 1
-                3, 4 -> 2
-                5, 6 -> 4
-                else -> 0
+                val type = (data[offset + 2].toInt() and 0xFF) or
+                    ((data[offset + 3].toInt() and 0xFF) shl 8)
+                val size = valueSize(type)
+                if (size == 0) continue
+
+                // Two layouts observed across Sony generations:
+                // standard PTP: code/type/getSet/default/current
+                // Sony variant: code/type/getSet/default/flag/current
+                val standard = readValue(data, offset + 5 + size, size)
+                val sonyFlagged = readValue(data, offset + 6 + size, size)
+
+                val from = (offset - 2).coerceAtLeast(0)
+                val to = (offset + 20).coerceAtMost(data.size)
+                val bytes = data.copyOfRange(from, to)
+                    .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+                return PropertyBlobHit(offset, type, standard, sonyFlagged, bytes)
             }
+            return null
+        }
 
-            val standard = if (valueSize > 0) readValue(offset + 5 + valueSize, valueSize) else null
-            val sonyFlagged = if (valueSize > 0) readValue(offset + 6 + valueSize, valueSize) else null
+        fun fmt16(value: Int?): String = value?.let { "0x%04X".format(it and 0xFFFF) } ?: "n/a"
+        fun fmt32(value: Int?): String = value?.let { "0x%08X".format(it) } ?: "n/a"
+        fun split32(value: Int?): String {
+            if (value == null) return "lo=n/a hi=n/a"
+            val lo = value and 0xFFFF
+            val hi = (value ushr 16) and 0xFFFF
+            return "lo=0x%04X(%d) hi=0x%04X(%d)".format(lo, lo, hi, hi)
+        }
 
-            if (selected == null) {
-                selected = when {
-                    standard in knownValues -> standard
-                    sonyFlagged in knownValues -> sonyFlagged
-                    else -> null
-                }
-            }
+        // Try direct Sony property-value reads first.
+        val areaDirect = transport.sendCommandWithData(
+            PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+            PtpConstants.PROP_SONY_FOCUS_AREA
+        )
+        val areaDirectValue = parseDirectValue(areaDirect.data)
 
-            val from = (offset - 2).coerceAtLeast(0)
-            val to = (offset + 16).coerceAtMost(data.size)
-            val bytes = data.copyOfRange(from, to)
-                .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-            hits += "D22C@$offset type=0x%04X std=%s sony=%s bytes=%s".format(
-                dataType,
-                standard?.let { "0x%04X".format(it) } ?: "n/a",
-                sonyFlagged?.let { "0x%04X".format(it) } ?: "n/a",
-                bytes
-            )
-            if (hits.size >= 2) break
+        val posDirect = transport.sendCommandWithData(
+            PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+            PtpConstants.PROP_SONY_AF_AREA_POSITION
+        )
+        val posDirectValue = parseDirectValue(posDirect.data)
+
+        // Also try Sony GetControlDeviceDesc for D2DC. On some generations
+        // control properties are described through 0x9206 instead of 0x9203/0x9204.
+        val posControlDesc = transport.sendCommandWithData(
+            PtpConstants.OP_SONY_GET_CONTROL_DEVICE_DESC,
+            PtpConstants.PROP_SONY_AF_AREA_POSITION
+        )
+
+        // One aggregate read lets us inspect both properties without adding
+        // another full 0x9209 transaction.
+        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        val areaHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_FOCUS_AREA) else null
+        val posHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_AF_AREA_POSITION) else null
+
+        val areaValue = when {
+            areaDirect.isSuccess && (areaDirectValue and 0xFFFF) in knownAreaValues -> areaDirectValue and 0xFFFF
+            areaHit?.standardValue != null && (areaHit.standardValue and 0xFFFF) in knownAreaValues -> areaHit.standardValue and 0xFFFF
+            areaHit?.sonyFlaggedValue != null && (areaHit.sonyFlaggedValue and 0xFFFF) in knownAreaValues -> areaHit.sonyFlaggedValue and 0xFFFF
+            else -> null
+        }
+
+        val positionValue = when {
+            posDirect.isSuccess && posDirect.data.size >= 4 -> posDirectValue
+            posHit?.standardValue != null -> posHit.standardValue
+            posHit?.sonyFlaggedValue != null -> posHit.sonyFlaggedValue
+            else -> null
         }
 
         val debug = buildString {
-            append(directSummary)
-            append("; 9209=OK ${all.dataSize}B")
-            if (hits.isEmpty()) append("; D22C NOT FOUND")
-            else append("; ").append(hits.joinToString(" | "))
+            append("model=").append(deviceName ?: "?")
+            append(" | D22C/9204=")
+            append(PtpConstants.responseCodeName(areaDirect.responseCode))
+            append(" ").append(areaDirect.dataSize).append("B ").append(fmt16(areaDirectValue))
+
+            append(" | D2DC/9204=")
+            append(PtpConstants.responseCodeName(posDirect.responseCode))
+            append(" ").append(posDirect.dataSize).append("B ").append(fmt32(posDirectValue))
+            append(" ").append(split32(posDirectValue))
+
+            append(" | D2DC/9206=")
+            append(PtpConstants.responseCodeName(posControlDesc.responseCode))
+            append(" ").append(posControlDesc.dataSize).append("B")
+            if (posControlDesc.data.isNotEmpty()) {
+                append(" bytes=")
+                append(posControlDesc.data.take(20).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) })
+            }
+
+            append(" | 9209=")
+            append(PtpConstants.responseCodeName(all.responseCode)).append(" ").append(all.dataSize).append("B")
+            if (areaHit == null) append(" D22C:not-found")
+            else append(" D22C@").append(areaHit.offset)
+                .append(" type=0x%04X".format(areaHit.dataType))
+                .append(" std=").append(fmt16(areaHit.standardValue))
+                .append(" sony=").append(fmt16(areaHit.sonyFlaggedValue))
+            if (posHit == null) append(" D2DC:not-found")
+            else append(" D2DC@").append(posHit.offset)
+                .append(" type=0x%04X".format(posHit.dataType))
+                .append(" std=").append(fmt32(posHit.standardValue))
+                .append(" sony=").append(fmt32(posHit.sonyFlaggedValue))
+                .append(" ").append(split32(positionValue))
         }
-        val result = FocusAreaProbe(selected, debug)
+
+        val result = FocusAreaProbe(areaValue, positionValue, debug)
         Log.d(TAG, "AF probe: ${result.debug}")
         return result
     }

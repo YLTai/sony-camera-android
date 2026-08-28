@@ -77,7 +77,8 @@ object PtpConstants {
     const val PROP_SONY_SHUTTER_SPEED = 0xD21D
     const val PROP_SONY_F_NUMBER = 0xD218
     const val PROP_SONY_FOCUS_MODE = 0xD208
-    const val PROP_SONY_FOCUS_AREA = 0xD22C // Sony Focus Area (PTP2)
+    const val PROP_SONY_FOCUS_AREA = 0xD22C // Sony Focus Area
+    const val PROP_SONY_AF_AREA_POSITION = 0xD2DC // AF Area Position (u32 on newer bodies)
     const val PROP_SONY_LIVEVIEW_STATE = 0xD221
     const val PROP_SONY_STILL_IMAGE_STORE_DEST = 0xD222  // 1=PC(SDRAM), 16=Card, 17=PC+Card
     const val PROP_SONY_PHOTO_TRANSFER_QUEUE = 0xD215    // Lower byte=queue count, upper byte 0x80=photo ready

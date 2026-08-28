@@ -127,8 +127,8 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     PreviewPlaceholder(state)
                 }
 
-                // ILCE-6600/PTP2 exposes the focus-area MODE via 0xD22C, but not
-                // an arbitrary live AF-frame XY coordinate. Center is deterministic.
+                // Focus-area mode (D22C). Position support differs by Sony generation;
+                // D2DC raw position data is shown in the AF DEBUG panel below.
                 focusAreaCode?.let { code ->
                     if (code == 0x0003 && f != null) {
                         FocusPointOverlay(modifier = Modifier.align(Alignment.Center))
@@ -264,7 +264,7 @@ private fun FocusDebugPanel(
             debug,
             color = Color.White.copy(alpha = 0.78f),
             fontSize = 8.sp,
-            maxLines = 4
+            maxLines = 7
         )
     }
 }
@@ -302,7 +302,7 @@ private fun FocusAreaPill(code: Int, modifier: Modifier = Modifier) {
             fontWeight = FontWeight.SemiBold
         )
         Text(
-            text = if (isCenter) "AF point: center" else "AF point: unavailable over PTP2",
+            text = if (isCenter) "AF point: center" else "AF position: see AF DEBUG",
             color = Color.White.copy(alpha = 0.72f),
             fontSize = 10.sp
         )
