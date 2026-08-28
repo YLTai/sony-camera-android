@@ -1,0 +1,27 @@
+name: Apply A7C II AF debug instrumentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-a7c2-af-debug-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Apply A7C II AF debug patch
+        run: python3 tools/apply_a7c2_af_debug.py
+      - name: Commit and push source changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add A7C II AF position diagnostics"
+          git push
