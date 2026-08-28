@@ -13,20 +13,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import kotlin.math.max
+
+enum class PeakingLevel(val label: String, internal val threshold: Int?) {
+    OFF("OFF", null),
+    LOW("LOW", 195),
+    MID("MID", 150),
+    HIGH("HIGH", 108)
+}
 
 /**
- * Lightweight red focus peaking generated from the live-view JPEG on-device.
- * The StateFlow intentionally conflates incoming frames while the previous mask
- * is being calculated so this assist feature never queues work behind liveview.
+ * Red focus peaking generated from the original live-view frame on-device.
+ * LOW is selective, HIGH shows more edges. Incoming frames are conflated so
+ * analysis never queues old frames behind the monitor display.
  */
 @Composable
 internal fun FocusPeakingOverlay(
     source: Bitmap?,
-    enabled: Boolean,
+    level: PeakingLevel,
     modifier: Modifier = Modifier
 ) {
     val latestSource = remember { MutableStateFlow<Bitmap?>(null) }
@@ -34,17 +43,19 @@ internal fun FocusPeakingOverlay(
 
     SideEffect { latestSource.value = source }
 
-    LaunchedEffect(enabled) {
-        if (!enabled) {
+    LaunchedEffect(level) {
+        val threshold = level.threshold
+        if (threshold == null) {
             overlay = null
             return@LaunchedEffect
         }
         latestSource.filterNotNull().collect { bitmap ->
-            overlay = withContext(Dispatchers.Default) { createPeakingMask(bitmap) }
+            overlay = withContext(Dispatchers.Default) { createPeakingMask(bitmap, threshold) }
+            delay(45)
         }
     }
 
-    if (enabled) {
+    if (level != PeakingLevel.OFF) {
         overlay?.let { mask ->
             Image(
                 bitmap = mask.asImageBitmap(),
@@ -56,16 +67,27 @@ internal fun FocusPeakingOverlay(
     }
 }
 
-private fun createPeakingMask(source: Bitmap): Bitmap {
-    val width = source.width
-    val height = source.height
+private fun createPeakingMask(source: Bitmap, threshold: Int): Bitmap {
+    val sample = if (source.width >= 900 || source.height >= 600) 2 else 1
+    val width = max(1, source.width / sample)
+    val height = max(1, source.height / sample)
     if (width < 3 || height < 3) {
-        return Bitmap.createBitmap(width.coerceAtLeast(1), height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     }
 
+    val fullPixels = IntArray(source.width * source.height)
+    source.getPixels(fullPixels, 0, source.width, 0, 0, source.width, source.height)
     val pixels = IntArray(width * height)
+    for (y in 0 until height) {
+        val sy = (y * sample).coerceAtMost(source.height - 1)
+        val sourceRow = sy * source.width
+        val row = y * width
+        for (x in 0 until width) {
+            val sx = (x * sample).coerceAtMost(source.width - 1)
+            pixels[row + x] = fullPixels[sourceRow + sx]
+        }
+    }
     val output = IntArray(width * height)
-    source.getPixels(pixels, 0, width, 0, 0, width, height)
 
     fun luma(color: Int): Int {
         val r = (color ushr 16) and 0xFF
@@ -74,8 +96,6 @@ private fun createPeakingMask(source: Bitmap): Bitmap {
         return (r * 77 + g * 150 + b * 29) ushr 8
     }
 
-    // Laplacian + axial gradient: crisp high-frequency detail scores much
-    // higher than soft transitions, which is exactly what focus peaking needs.
     for (y in 1 until height - 1) {
         val row = y * width
         for (x in 1 until width - 1) {
@@ -90,8 +110,8 @@ private fun createPeakingMask(source: Bitmap): Bitmap {
             val laplacian = abs(c * 4 - left - right - up - down)
             val score = gradient + laplacian * 2
 
-            if (score > 150 && c > 12) {
-                val alpha = (135 + (score - 150) / 2).coerceIn(135, 235)
+            if (score > threshold && c > 12) {
+                val alpha = (125 + (score - threshold) / 2).coerceIn(125, 235)
                 output[i] = (alpha shl 24) or 0x00FF2F2F
             }
         }
