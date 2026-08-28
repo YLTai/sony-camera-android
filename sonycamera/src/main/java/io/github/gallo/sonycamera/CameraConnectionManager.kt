@@ -4,9 +4,6 @@ import android.graphics.Bitmap
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
-/**
- * Camera connection state.
- */
 sealed class CameraConnectionState {
     data object Disconnected : CameraConnectionState()
     data object Scanning : CameraConnectionState()
@@ -16,11 +13,6 @@ sealed class CameraConnectionState {
     data class Error(val message: String) : CameraConnectionState()
 }
 
-/**
- * A focus frame reported by Sony's FocalFrameInfo dataset embedded in each
- * protocol-3 live-view object. Coordinates and dimensions are kept in the
- * camera's numerator/denominator form so the UI never has to guess frame size.
- */
 data class CameraFocusFrame(
     val type: Int,
     val state: Int,
@@ -32,14 +24,10 @@ data class CameraFocusFrame(
     val width: Long,
     val height: Long
 ) {
-    val centerXNormalized: Float
-        get() = normalized(xNumerator, xDenominator)
-    val centerYNormalized: Float
-        get() = normalized(yNumerator, yDenominator)
-    val widthNormalized: Float
-        get() = normalized(width, xDenominator)
-    val heightNormalized: Float
-        get() = normalized(height, yDenominator)
+    val centerXNormalized: Float get() = normalized(xNumerator, xDenominator)
+    val centerYNormalized: Float get() = normalized(yNumerator, yDenominator)
+    val widthNormalized: Float get() = normalized(width, xDenominator)
+    val heightNormalized: Float get() = normalized(height, yDenominator)
 
     private fun normalized(value: Long, denominator: Long): Float {
         if (denominator <= 0L) return 0f
@@ -47,33 +35,28 @@ data class CameraFocusFrame(
     }
 }
 
-/** A complete focus-frame snapshot synchronized with a Sony live-view frame. */
 data class CameraFocusFrameInfo(
     val version: Int,
     val frames: List<CameraFocusFrame>
 )
 
-/** Exposure controls surfaced by the monitor UI. */
 enum class CameraExposureSetting {
     APERTURE,
     SHUTTER_SPEED,
     ISO
 }
 
-/** One camera-reported exposure choice. [rawValue] is the exact PTP value. */
 data class CameraExposureOption(
     val rawValue: Long,
     val label: String
 )
 
-/** Current value and the camera-supported choices for one exposure control. */
 data class CameraExposureProperty(
     val current: CameraExposureOption?,
     val options: List<CameraExposureOption>,
     val writable: Boolean
 )
 
-/** Exposure snapshot used by the monitor top bar. */
 data class CameraExposureState(
     val aperture: CameraExposureProperty,
     val shutterSpeed: CameraExposureProperty,
@@ -86,90 +69,100 @@ data class CameraExposureState(
     }
 }
 
-/**
- * Events emitted by the camera connection.
- */
+/** Generic camera controls surfaced by Sony protocol-3 property snapshots. */
+enum class CameraSetting {
+    FOCUS_MODE,
+    FOCUS_AREA,
+    WHITE_BALANCE,
+    METERING_MODE,
+    DRIVE_MODE,
+    EXPOSURE_COMPENSATION
+}
+
+data class CameraSettingOption(
+    val rawValue: Long,
+    val label: String
+)
+
+data class CameraSettingProperty(
+    val current: CameraSettingOption?,
+    val options: List<CameraSettingOption>,
+    /**
+     * True means the UI should offer choices. Some Sony bodies mark a control
+     * read-only in the descriptor but still accept SetControlDeviceA, so known
+     * camera-control properties are allowed to be write-attempted.
+     */
+    val writable: Boolean
+)
+
+data class CameraSettingsState(
+    val focusMode: CameraSettingProperty,
+    val focusArea: CameraSettingProperty,
+    val whiteBalance: CameraSettingProperty,
+    val meteringMode: CameraSettingProperty,
+    val driveMode: CameraSettingProperty,
+    val exposureCompensation: CameraSettingProperty
+) {
+    fun property(setting: CameraSetting): CameraSettingProperty = when (setting) {
+        CameraSetting.FOCUS_MODE -> focusMode
+        CameraSetting.FOCUS_AREA -> focusArea
+        CameraSetting.WHITE_BALANCE -> whiteBalance
+        CameraSetting.METERING_MODE -> meteringMode
+        CameraSetting.DRIVE_MODE -> driveMode
+        CameraSetting.EXPOSURE_COMPENSATION -> exposureCompensation
+    }
+}
+
 sealed class CameraEvent {
     data class PhotoCaptured(val bitmap: Bitmap) : CameraEvent()
     data class Error(val message: String) : CameraEvent()
     data object ConnectionLost : CameraEvent()
-    
-    /**
-     * Current Sony focus-area mode reported by device property 0xD22C.
-     * The raw value preserves forward compatibility with newer bodies.
-     */
+
     data class FocusAreaUpdated(val rawValue: Int) : CameraEvent()
-
-    /** Diagnostic information from the Sony focus-area probe. */
     data class FocusDebug(val message: String) : CameraEvent()
-
-    /** Last AF target accepted by the app-side Sony control path. */
     data class AfTargetUpdated(val x: Int, val y: Int) : CameraEvent()
-
-    /** Real focus frames returned by the camera in the current live-view dataset. */
     data class FocusFramesUpdated(val info: CameraFocusFrameInfo) : CameraEvent()
-
-    /** Current aperture / shutter / ISO values and selectable camera steps. */
     data class ExposureUpdated(val state: CameraExposureState) : CameraEvent()
+    data class CameraSettingsUpdated(val state: CameraSettingsState) : CameraEvent()
 
-    /**
-     * The shutter is firing now — the capture sequence has just begun.
-     * Emitted so the UI flash/sound coincide with the real capture instead
-     * of leading it. The live preview was running right up to this instant.
-     */
     data object ShutterFired : CameraEvent()
 }
 
-/**
- * Result of a camera operation.
- */
 sealed class CameraOperationResult {
     data object Success : CameraOperationResult()
     data class SuccessWithData<T>(val data: T) : CameraOperationResult()
     data class Failure(val message: String) : CameraOperationResult()
 }
 
-/**
- * Interface for camera connections. Implemented by the USB (PTP protocol) transport.
- */
 interface CameraConnectionManager {
-
-    /** Current connection state. */
     val connectionState: StateFlow<CameraConnectionState>
-
-    /** Name of the connected camera (e.g., "Sony ILCE-6600"). */
     val cameraName: StateFlow<String?>
-
-    /** Camera events (photo captured, errors, connection lost). */
     val events: SharedFlow<CameraEvent>
-
-    /** Liveview frames delivered as Bitmaps over USB PTP. */
     val liveviewFrames: SharedFlow<Bitmap>
 
-    /** Start liveview streaming. */
     suspend fun startLiveview(): CameraOperationResult
-
-    /** Stop liveview streaming. */
     suspend fun stopLiveview(): CameraOperationResult
-
-    /** Take a photo and return the captured bitmap. */
     suspend fun takePhoto(): CameraOperationResult
-
-    /** Move the Sony AF target on its 640x480 logical focus grid. */
     suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult
-
-    /** Diagnostic: write Sony AF Area Position to the protocol center (320, 240). */
     suspend fun testAfCenter(): CameraOperationResult
 
-    /** Step one exposure control to the previous/next camera-supported value. */
     suspend fun adjustExposure(
         setting: CameraExposureSetting,
         direction: Int
     ): CameraOperationResult
 
-    /** Disconnect from the camera. */
-    fun disconnect()
+    /** Set an exact camera-reported exposure value selected by the UI. */
+    suspend fun setExposure(
+        setting: CameraExposureSetting,
+        rawValue: Long
+    ): CameraOperationResult
 
-    /** Whether the camera is connected and ready. */
+    /** Set one exact option from a generic Sony/PTP camera setting. */
+    suspend fun setCameraSetting(
+        setting: CameraSetting,
+        rawValue: Long
+    ): CameraOperationResult
+
+    fun disconnect()
     fun isReady(): Boolean
 }
