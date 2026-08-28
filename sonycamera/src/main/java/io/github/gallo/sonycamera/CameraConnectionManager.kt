@@ -17,6 +17,43 @@ sealed class CameraConnectionState {
 }
 
 /**
+ * A focus frame reported by Sony's FocalFrameInfo dataset embedded in each
+ * protocol-3 live-view object. Coordinates and dimensions are kept in the
+ * camera's numerator/denominator form so the UI never has to guess frame size.
+ */
+data class CameraFocusFrame(
+    val type: Int,
+    val state: Int,
+    val priority: Int,
+    val xNumerator: Long,
+    val yNumerator: Long,
+    val xDenominator: Long,
+    val yDenominator: Long,
+    val width: Long,
+    val height: Long
+) {
+    val centerXNormalized: Float
+        get() = normalized(xNumerator, xDenominator)
+    val centerYNormalized: Float
+        get() = normalized(yNumerator, yDenominator)
+    val widthNormalized: Float
+        get() = normalized(width, xDenominator)
+    val heightNormalized: Float
+        get() = normalized(height, yDenominator)
+
+    private fun normalized(value: Long, denominator: Long): Float {
+        if (denominator <= 0L) return 0f
+        return (value.toDouble() / denominator.toDouble()).toFloat().coerceIn(0f, 1f)
+    }
+}
+
+/** A complete focus-frame snapshot synchronized with a Sony live-view frame. */
+data class CameraFocusFrameInfo(
+    val version: Int,
+    val frames: List<CameraFocusFrame>
+)
+
+/**
  * Events emitted by the camera connection.
  */
 sealed class CameraEvent {
@@ -35,6 +72,9 @@ sealed class CameraEvent {
 
     /** Last AF target accepted by the app-side Sony control path. */
     data class AfTargetUpdated(val x: Int, val y: Int) : CameraEvent()
+
+    /** Real focus frames returned by the camera in the current live-view dataset. */
+    data class FocusFramesUpdated(val info: CameraFocusFrameInfo) : CameraEvent()
 
     /**
      * The shutter is firing now — the capture sequence has just begun.
