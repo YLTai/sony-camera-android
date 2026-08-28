@@ -80,14 +80,13 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     /**
      * Open a PTP session. Must be called before any other operations.
      *
-     * Uses a short response timeout (1.5s) instead of the default 5s.
-     * A healthy camera responds in <100ms; if it doesn't respond at all
-     * (stale-session scenario after app swipe-away), we want to fail fast
-     * so the caller can escalate to a heavier USB reset.
+     * Keep this attempt deliberately short. The connection manager owns the
+     * one permitted USB Device-Reset recovery, so this method must not hide a
+     * 7+ second retry loop behind a Boolean result.
      */
     fun openSession(): Boolean {
         transport.resetTransactionId()
-        val response = transport.sendCommand(
+        var response = transport.sendCommand(
             PtpConstants.OP_OPEN_SESSION,
             responseTimeoutMs = 1500,
             params = intArrayOf(SESSION_ID)
@@ -96,135 +95,92 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             Log.d(TAG, "PTP session opened")
             return true
         }
-        Log.e(TAG, "Failed to open session: $response")
 
-        when (response.responseCode) {
-            // 0x201E "Session Already Open" — close the stale session then retry.
-            0x201E -> {
-                closeSession()
-                val retry = transport.sendCommand(
-                    PtpConstants.OP_OPEN_SESSION,
-                    responseTimeoutMs = 1500,
-                    params = intArrayOf(SESSION_ID)
-                )
-                if (retry.isSuccess) Log.d(TAG, "PTP session opened (after stale-session close)")
-                return retry.isSuccess
-            }
-            // 0x2002 "General Error" — typically seen on the FIRST openSession
-            // after a recent endSession; the camera needs a few seconds to
-            // finish resetting its internal PC-Remote state. Empirically the
-            // ILCE-6600 needs ~3-4s; we retry up to 3 times with growing
-            // gaps so a slow body still recovers in one user-perceived
-            // attempt rather than forcing the user to tap Connect again.
-            0x2002 -> {
-                val delays = longArrayOf(2000, 2500, 3000) // total ~7.5s worst case
-                for ((attempt, delayMs) in delays.withIndex()) {
-                    Log.d(TAG, "General Error on openSession — settling ${delayMs}ms, retry ${attempt + 1}/${delays.size}")
-                    Thread.sleep(delayMs)
-                    transport.resetTransactionId()
-                    val retry = transport.sendCommand(
-                        PtpConstants.OP_OPEN_SESSION,
-                        responseTimeoutMs = 1500,
-                        params = intArrayOf(SESSION_ID)
-                    )
-                    if (retry.isSuccess) {
-                        Log.d(TAG, "PTP session opened (retry ${attempt + 1}, ${delayMs}ms settle)")
-                        return true
-                    }
-                    Log.w(TAG, "openSession retry ${attempt + 1} failed: $retry")
-                }
-                return false
+        // SessionAlreadyOpen: try the standard CloseSession once, then reopen.
+        // If that does not work, the manager will perform one class Device Reset.
+        if (response.responseCode == 0x201E) {
+            Log.w(TAG, "PTP session already open — closing stale session once")
+            closeSession()
+            Thread.sleep(120)
+            transport.resetTransactionId()
+            response = transport.sendCommand(
+                PtpConstants.OP_OPEN_SESSION,
+                responseTimeoutMs = 1500,
+                params = intArrayOf(SESSION_ID)
+            )
+            if (response.isSuccess) {
+                Log.d(TAG, "PTP session opened after stale-session close")
+                return true
             }
         }
+
+        Log.e(TAG, "OpenSession failed: $response")
         return false
     }
 
     /**
-     * Close the PTP session (PTP CloseSession, opcode 0x1003). The standard
-     * spec marks it parameter-less, but Sony's implementation in practice
-     * needs the Session ID echoed back — without it the camera ACKs the
-     * close but keeps the session open internally, which manifests as
-     * "session already open" (0x201E) on the next OpenSession.
-     *
-     * Used internally for the "session already open" retry path during
-     * connect; for normal teardown use [endSession] so the camera also exits
-     * PC-Remote mode.
+     * Close the PTP session (standard PTP CloseSession, no parameters).
+     * Keep teardown bounded so a previous disconnect cannot overlap a new
+     * connection for many seconds.
      */
     fun closeSession() {
         try {
             val response = transport.sendCommand(
                 operationCode = PtpConstants.OP_CLOSE_SESSION,
-                responseTimeoutMs = PtpConstants.USB_TIMEOUT_MS,
-                params = intArrayOf(SESSION_ID)
+                responseTimeoutMs = 1200
             )
-            Log.d(TAG, "PTP CloseSession(session=$SESSION_ID): " +
-                    PtpConstants.responseCodeName(response.responseCode))
+            Log.d(TAG, "PTP CloseSession: ${PtpConstants.responseCodeName(response.responseCode)}")
         } catch (e: Exception) {
             Log.w(TAG, "Error closing session: ${e.message}")
         }
     }
 
     /**
-     * Gracefully end the PC-Remote session. Releases the Sony "USB host has
-     * control" priority flag set in [initSonyExtension] so the camera regains
-     * its on-body controls, then sends a PTP CloseSession to tell the camera
-     * we're done with the session. After this the camera is free to return to
-     * its normal operating state.
+     * Gracefully end the PC-Remote session.
      *
-     * Best-effort — both steps are wrapped in try/catch so a yanked cable or
-     * already-dead camera doesn't throw on the way out.
+     * SDIOConnect(3) is part of Sony's connection initialization sequence on
+     * newer protocol-3 bodies; it is not a hang-up command. Teardown only
+     * releases host priority and closes the standard PTP session.
      */
     fun endSession() {
-        // Hand control back to the camera body before closing the session.
-        // Inverse of the PROP_SONY_PRIORITY_MODE = 1 we set during init.
         try {
             setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 0)
             Log.d(TAG, "Released Sony priority — camera regains control")
         } catch (e: Exception) {
             Log.w(TAG, "Error releasing Sony priority: ${e.message}")
         }
-
-        // SDIO close handshake (phase 3) — the explicit "exit PC Remote"
-        // hangup. We send phases 1 & 2 to open in initSonyExtension; phase 3
-        // is the corresponding close. It's known to stall the USB pipe on
-        // a6x00 bodies — fine here, because we close the connection right
-        // after. Without this, the camera typically keeps its "PC" indicator
-        // lit until the cable is physically yanked.
-        try {
-            transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 3, 0, 0)
-            Log.d(TAG, "Sony SDIO close (phase 3) sent")
-        } catch (e: Exception) {
-            Log.w(TAG, "Sony SDIO close (phase 3) errored — expected on a6x00: ${e.message}")
-        }
-
         closeSession()
     }
 
     /**
-     * Initialize Sony SDIO connection. Must be called after openSession()
-     * and before any Sony vendor-specific commands.
+     * Initialize Sony SDIO / PC-Remote connection.
      *
-     * SDIOConnect returns data phases, so we use sendCommandWithData.
-     * Only phases 1 and 2 are needed — phase 3 stalls USB on a6600.
+     * Newer protocol-3 Sony bodies require the full 1 -> 2 -> vendor-info -> 3
+     * sequence before host priority is asserted. Older a6x00-style bodies keep
+     * the proven phase-1/2 path because phase 3 is known to stall on some of
+     * them. Every mandatory stage is checked; callers must not publish Ready
+     * after a half-completed vendor handshake.
      */
     fun initSonyExtension(): Boolean {
         Log.d(TAG, "Initializing Sony SDIO extension...")
 
-        val r1 = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 1, 0, 0)
+        val r1 = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_SDIO_CONNECT, 2000, 1, 0, 0
+        )
         Log.d(TAG, "SDIOConnect(1): ${PtpConstants.responseCodeName(r1.responseCode)}")
+        if (!r1.isSuccess) return false
 
-        val r2 = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 2, 0, 0)
+        val r2 = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_SDIO_CONNECT, 2000, 2, 0, 0
+        )
         Log.d(TAG, "SDIOConnect(2): ${PtpConstants.responseCodeName(r2.responseCode)}")
+        if (!r2.isSuccess) return false
 
-        // ILCE-7CM2 / A7C II is a newer Sony body. libgphoto2-style Sony
-        // protocol negotiation requests generation 3 (300 / 0x012C) with a
-        // second parameter of 1. Older bodies keep the proven 200 / 0x00C8
-        // path. If the A7C II rejects protocol 3 or returns no extension data,
-        // immediately fall back rather than breaking liveview/capture.
         val preferProtocol3 = deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true
         val extV3 = if (preferProtocol3) {
-            transport.sendCommandWithData(
+            transport.sendCommandWithDataShortTimeout(
                 PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO,
+                2500,
                 0x012C,
                 1
             )
@@ -234,13 +190,36 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val extInfo = if (useProtocol3) {
             extV3!!
         } else {
-            transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO, 0x00C8)
+            transport.sendCommandWithDataShortTimeout(
+                PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO,
+                2500,
+                0x00C8
+            )
         }
         val selectedProtocol = if (useProtocol3) 300 else 200
         Log.d(TAG, "GetExtDeviceInfo protocol=$selectedProtocol: " +
                 "${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
+        if (!extInfo.isSuccess || extInfo.dataSize == 0) return false
 
-        val props = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        // libgphoto2 / Sony PC-Remote traces complete SDIOConnect phase 3
+        // before asserting PriorityMode. Restrict it to the newer body path so
+        // we do not regress older cameras where phase 3 can stall.
+        val r3 = if (preferProtocol3) {
+            transport.sendCommandWithDataShortTimeout(
+                PtpConstants.OP_SONY_SDIO_CONNECT, 2000, 3, 0, 0
+            )
+        } else null
+        if (r3 != null) {
+            Log.d(TAG, "SDIOConnect(3): ${PtpConstants.responseCodeName(r3.responseCode)}")
+            if (!r3.isSuccess) return false
+            Thread.sleep(150)
+        }
+
+        // Property snapshot is useful for diagnostics but is not required to
+        // decide whether the transport-level Sony handshake succeeded.
+        val props = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA, 2500
+        )
         Log.d(TAG, "GetAllDevicePropData: ${PtpConstants.responseCodeName(props.responseCode)}, ${props.dataSize}B")
 
         sonyExtensionDebug = buildString {
@@ -249,6 +228,8 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 append(" v3=")
                 append(PtpConstants.responseCodeName(extV3?.responseCode ?: 0))
                 append("/").append(extV3?.dataSize ?: 0).append("B")
+                append(" sdio3=")
+                append(PtpConstants.responseCodeName(r3?.responseCode ?: 0))
             }
             append(" extInfo=")
             append(PtpConstants.responseCodeName(extInfo.responseCode))
@@ -258,10 +239,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             append("/").append(props.dataSize).append("B")
         }
 
-        // Tell camera that USB host has control — required before shutter commands work
+        // Tell camera that USB host has control. Some Sony commands acknowledge
+        // slowly/silently, so keep this best-effort after the mandatory SDIO
+        // stages rather than treating a quick-response timeout as disconnect.
         setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
-
-        return r1.isSuccess && r2.isSuccess
+        return true
     }
 
     /**

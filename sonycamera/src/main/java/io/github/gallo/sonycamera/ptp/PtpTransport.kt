@@ -42,66 +42,48 @@ class PtpTransport(
     private var transactionId = 0
 
     /**
-     * Full USB/PTP reset sequence. Clears stalled endpoints and resets
-     * the PTP session state on the camera. Required when reconnecting
-     * to a camera that had a previous PTP session.
-     */
-    /**
-     * Gentle PTP/USB reset. This is the known-good pre-hardening sequence —
-     * single cancel + single device reset + clear halt + simple drain + a
-     * short settle. It's calibrated for fresh plug-ins where the camera
-     * just came out of enumeration and is in a clean state.
+     * Recover a PTP interface after OpenSession has actually failed.
      *
-     * It intentionally does NOT try to be smart about stale sessions —
-     * aggressive secondary resets were observed to wedge the Sony a6600's
-     * liveview engine even after the camera was power-cycled. Stale-session
-     * recovery is handled by the heavy-reset retry in
-     * [UsbCameraConnectionManager.connectToDevice]: if the first OpenSession
-     * fails, that path releases the USB interface, closes the device
-     * handle, reopens it, and calls resetDevice again — which is the USB
-     * equivalent of unplug/replug and reliably recovers stale state without
-     * harming the camera.
+     * Healthy Sony connections must not be reset pre-emptively: doing so can
+     * knock a freshly-enumerated camera out of its PC-Remote state. This path
+     * mirrors mature PTP clients: attempt OpenSession first, then issue the
+     * Still Image Class Device Reset (0x66) only as a single recovery step.
+     *
+     * The USB class request is interface-recipient, so wIndex must be the
+     * claimed interface id. We intentionally do not send Cancel Request 0x64
+     * here: that request requires a transaction-specific payload and a bogus
+     * zero-length cancel can itself disturb the Sony state machine.
      */
-    fun resetDevice() = lock.withLock {
-        // Step 1: Cancel any pending PTP request (0x64)
-        val cancelResult = connection.controlTransfer(
-            0x21, 0x64, 0, 0, null, 0, 2000
-        )
-        Log.d(TAG, "PTP cancel request result: $cancelResult")
-        Thread.sleep(100)
+    fun recoverAfterFailedOpenSession(interfaceId: Int) = lock.withLock {
+        Log.w(TAG, "Recovering PTP after failed OpenSession (interface=$interfaceId)")
 
-        // Step 2: PTP Device Reset (0x66)
         val resetResult = connection.controlTransfer(
-            0x21, 0x66, 0, 0, null, 0, 5000
+            0x21, 0x66, 0, interfaceId, null, 0, 1500
         )
-        Log.d(TAG, "PTP device reset result: $resetResult")
-        Thread.sleep(100)
+        Log.d(TAG, "PTP Device Reset result: $resetResult")
+        Thread.sleep(120)
 
-        // Step 3: Clear HALT on bulk endpoints
         val clearOut = connection.controlTransfer(
-            0x02, 0x01, 0, bulkOut.address, null, 0, 2000
+            0x02, 0x01, 0, bulkOut.address, null, 0, 1000
         )
-        Log.d(TAG, "Clear HALT on bulkOut (addr=${bulkOut.address}): $clearOut")
-
         val clearIn = connection.controlTransfer(
-            0x02, 0x01, 0, bulkIn.address, null, 0, 2000
+            0x02, 0x01, 0, bulkIn.address, null, 0, 1000
         )
-        Log.d(TAG, "Clear HALT on bulkIn (addr=${bulkIn.address}): $clearIn")
+        Log.d(TAG, "Recovery clear HALT: out=$clearOut in=$clearIn")
 
-        // Step 4: Drain stale data from bulk IN (leftovers from MTP service
-        // probing, or a previously-interrupted transfer).
+        // Bounded stale-data drain. Never let recovery itself become a long
+        // loading screen if the camera is continuously producing data.
         val drainBuf = ByteArray(512)
         var drained = 0
-        while (true) {
-            val read = connection.bulkTransfer(bulkIn, drainBuf, drainBuf.size, 200)
-            if (read <= 0) break
-            drained += read
+        repeat(8) {
+            val n = connection.bulkTransfer(bulkIn, drainBuf, drainBuf.size, 60)
+            if (n <= 0) return@repeat
+            drained += n
         }
-        if (drained > 0) Log.d(TAG, "Drained $drained stale bytes from bulk IN")
+        if (drained > 0) Log.d(TAG, "Recovery drained $drained stale bytes")
 
-        // Step 5: Short settle so the camera's PTP state machine is ready
-        // to accept OpenSession.
-        Thread.sleep(500)
+        transactionId = 0
+        Thread.sleep(180)
     }
 
     /**
@@ -139,7 +121,11 @@ class PtpTransport(
             buffer.putInt(param)
         }
 
-        val sent = connection.bulkTransfer(bulkOut, buffer.array(), containerLength, 10000)
+        // Short handshake calls (notably OpenSession) must also bound the
+        // OUT transfer; otherwise a dead endpoint can still block for 10s
+        // before the caller gets its 1.5s response timeout.
+        val sendTimeoutMs = responseTimeoutMs.coerceIn(500, PtpConstants.USB_TIMEOUT_MS)
+        val sent = connection.bulkTransfer(bulkOut, buffer.array(), containerLength, sendTimeoutMs)
         if (sent < 0) {
             Log.e(TAG, "Failed to send command 0x${operationCode.toString(16)}, bulkTransfer returned $sent")
             return@withLock PtpResponse(PtpConstants.RESP_GENERAL_ERROR, txId)

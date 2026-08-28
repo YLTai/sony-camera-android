@@ -113,6 +113,7 @@ class UsbCameraConnectionManager(
     // connect attempt that's mid-handshake so its coroutine can run its
     // finally-block cleanup instead of leaking a claimed interface.
     private var connectJob: Job? = null
+    private var teardownJob: Job? = null
 
     // Reconnect bookkeeping. When the cable is physically detached we don't
     // immediately surface ConnectionLost — we hold the UI in "Connecting" for
@@ -308,7 +309,7 @@ class UsbCameraConnectionManager(
             // unplug does. After NEVER seeing a first frame for this many
             // milliseconds, give up and surface ConnectionLost so the UI
             // can prompt the user to unplug/replug.
-            val neverGotFrameFatalMs = 18_000L
+            val neverGotFrameFatalMs = 10_000L
             val liveviewStartTime = System.currentTimeMillis()
 
             while (isActive && isLiveviewActive) {
@@ -654,7 +655,7 @@ class UsbCameraConnectionManager(
         // Run the teardown on a scope that survives engine.destroy()'s
         // scope.cancel — otherwise endSession can be cancelled before its
         // USB transactions reach the camera.
-        teardownScope.launch {
+        teardownJob = teardownScope.launch {
             Log.d(TAG, "USB teardown: ending camera session")
             try {
                 // Graceful end: release Sony priority + PTP CloseSession so
@@ -746,6 +747,18 @@ class UsbCameraConnectionManager(
         try {
             _connectionState.value = CameraConnectionState.Connecting
 
+            // A previous user disconnect may still be finishing its final
+            // CloseSession on another UsbDeviceConnection. Give it a short,
+            // bounded chance to finish so old teardown commands cannot land in
+            // the middle of this new session.
+            teardownJob?.let { previousTeardown ->
+                if (previousTeardown.isActive) {
+                    Log.d(TAG, "Waiting briefly for previous USB teardown")
+                    kotlinx.coroutines.withTimeoutOrNull(1800) { previousTeardown.join() }
+                }
+            }
+            teardownJob = null
+
             // Log all device interfaces for debugging
             Log.d(TAG, "USB Device: vendor=0x${device.vendorId.toString(16)}, product=0x${device.productId.toString(16)}, class=${device.deviceClass}")
             Log.d(TAG, "  Interfaces: ${device.interfaceCount}")
@@ -821,36 +834,39 @@ class UsbCameraConnectionManager(
 
             _connectionState.value = CameraConnectionState.Initializing
 
-            // Single-attempt PTP handshake. We intentionally do NOT retry
-            // by closing and reopening the USB device — that "heavy reset"
-            // was observed to push the Sony a6600 firmware into a wedged
-            // state where every subsequent command times out with General
-            // Error, requiring a battery pull to recover. When the camera
-            // is mid-session (swipe-away scenario) it keeps pumping liveview
-            // data into the pipe; closing+reopening just re-fills the pipe
-            // and confuses the camera further. If this attempt fails, we
-            // surface a clear error asking the user to unplug/replug — the
-            // physical detach-reattach path is reliable and triggers our
-            // auto-reconnect flow cleanly.
+            // Normal path first: claim -> OpenSession. Do not reset a healthy,
+            // freshly-enumerated Sony camera before its first PTP command.
             val transport = PtpTransport(localConn, bulkOut, bulkIn, interruptIn)
-            Log.d(TAG, "Sending PTP device reset...")
-            transport.resetDevice()
-
             localCamera = SonyPtpCamera(transport)
 
             if (!localCamera.openSession()) {
-                _connectionState.value = CameraConnectionState.Error(
-                    "Can't talk to the camera. Unplug the USB cable, wait a moment, then plug it back in."
-                )
-                return@withContext
+                // One bounded recovery only after a genuine OpenSession failure,
+                // matching mature PTP clients. No close/reopen loop and no 7.5s
+                // blind General-Error sleeps.
+                Log.w(TAG, "Initial OpenSession failed — attempting one PTP Device Reset recovery")
+                transport.recoverAfterFailedOpenSession(localIface.id)
+                localCamera = SonyPtpCamera(transport)
+                if (!localCamera.openSession()) {
+                    _connectionState.value = CameraConnectionState.Error(
+                        "Camera did not accept a PTP session. Close other camera apps and reconnect."
+                    )
+                    return@withContext
+                }
             }
 
             if (!localCamera.getDeviceInfo()) {
-                Log.w(TAG, "Could not get device info, continuing anyway")
+                Log.w(TAG, "Could not get device info, continuing with generic Sony identity")
             }
 
-            // Initialize Sony vendor extension (required for Sony-specific commands)
-            localCamera.initSonyExtension()
+            // Mandatory Sony vendor handshake. Never publish Ready after only
+            // part of SDIOConnect succeeded — that produces the long, doomed
+            // liveview wait users were seeing.
+            if (!localCamera.initSonyExtension()) {
+                _connectionState.value = CameraConnectionState.Error(
+                    "Sony PC Remote initialization failed. Disconnect once and try again."
+                )
+                return@withContext
+            }
 
             // Commit: take ownership of the resources.
             usbDevice = device
@@ -864,15 +880,11 @@ class UsbCameraConnectionManager(
 
             Log.d(TAG, "USB camera connected: ${localCamera.deviceName}")
 
-            // Pre-warm the shutter pipeline BEFORE starting liveview. The
-            // first SetControlDeviceB(SHUTTER) on a fresh PC-Remote session
-            // takes ~8s for the camera firmware to context-switch into
-            // capture-handling mode. Doing it here (inside the connection
-            // flow the user is already waiting on) means the user's first
-            // real shot uses the fast path. Done before liveview so the
-            // pre-warm itself isn't fighting liveview for the PTP lock.
-            localCamera.prewarmShutter()
+            // Do not touch the shutter during connection. A half-press here
+            // adds another vendor-control transaction exactly when the camera has
+            // just entered PC Remote and can destabilize first-liveview startup.
 
+            // Auto-start liveview — camera is already in PC Remote mode
             // Auto-start liveview — camera is already in PC Remote mode
             // with liveview active after SDIO init
             Log.d(TAG, "Auto-starting USB liveview...")
