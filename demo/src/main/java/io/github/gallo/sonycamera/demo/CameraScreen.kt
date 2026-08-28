@@ -938,7 +938,7 @@ private fun LutPanel(
                         ) {
                             Text(lut.displayName, color = Color.White, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(
-                                if (isSelected) "SELECTED  •  HOLD X" else ".CUBE",
+                                if (isSelected) "SELECTED" else ".CUBE",
                                 color = Color.White.copy(alpha = 0.42f),
                                 fontSize = 6.sp,
                                 maxLines = 1
@@ -1095,9 +1095,9 @@ private fun PreviewPlaceholder(state: CameraConnectionState) {
 
 private fun nextPeakingLevel(level: PeakingLevel): PeakingLevel = when (level) {
     PeakingLevel.OFF -> PeakingLevel.MID
-    PeakingLevel.LOW -> PeakingLevel.MID
     PeakingLevel.MID -> PeakingLevel.HIGH
     PeakingLevel.HIGH -> PeakingLevel.LOW
+    PeakingLevel.LOW -> PeakingLevel.OFF
 }
 
 private fun nextZebraThreshold(current: Int?): Int? = when (current) {
