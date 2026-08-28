@@ -634,10 +634,14 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val areaHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_FOCUS_AREA) else null
         val posHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_AF_AREA_POSITION) else null
 
+        val areaDirect16 = areaDirectValue?.and(0xFFFF)
+        val areaStandard16 = areaHit?.standardValue?.and(0xFFFF)
+        val areaSony16 = areaHit?.sonyFlaggedValue?.and(0xFFFF)
+
         val areaValue = when {
-            areaDirect.isSuccess && (areaDirectValue and 0xFFFF) in knownAreaValues -> areaDirectValue and 0xFFFF
-            areaHit?.standardValue != null && (areaHit.standardValue and 0xFFFF) in knownAreaValues -> areaHit.standardValue and 0xFFFF
-            areaHit?.sonyFlaggedValue != null && (areaHit.sonyFlaggedValue and 0xFFFF) in knownAreaValues -> areaHit.sonyFlaggedValue and 0xFFFF
+            areaDirect.isSuccess && areaDirect16 != null && areaDirect16 in knownAreaValues -> areaDirect16
+            areaStandard16 != null && areaStandard16 in knownAreaValues -> areaStandard16
+            areaSony16 != null && areaSony16 in knownAreaValues -> areaSony16
             else -> null
         }
 
