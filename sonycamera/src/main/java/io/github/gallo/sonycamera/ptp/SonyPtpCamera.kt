@@ -999,6 +999,37 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
+     * Wait for Sony's RAM photo-transfer flag (D215 high byte 0x80) to clear.
+     * libgphoto2 observes the value transition from e.g. 0x8001 to 0x0001
+     * after the 0xFFFFC001 object has been consumed. Restarting liveview before
+     * that transition can make the camera reject 0xFFFFC002 for several seconds.
+     */
+    fun waitForCaptureIdle(maxWaitMs: Long = 3_500L): Boolean {
+        val started = System.currentTimeMillis()
+        var clearSamples = 0
+        var last: PhotoQueueStatus? = null
+
+        while (System.currentTimeMillis() - started < maxWaitMs) {
+            last = getPhotoTransferQueueStatus()
+            if (last != null && !last.photoAvailable) {
+                clearSamples++
+                // Require two reads so we do not race a transient property update.
+                if (clearSamples >= 2) {
+                    Log.d(TAG, "Capture queue idle: raw=0x${last.rawValue.toString(16)} count=${last.queuedCount}")
+                    return true
+                }
+            } else {
+                clearSamples = 0
+            }
+            Thread.sleep(120)
+        }
+
+        val lastLabel = last?.rawValue?.let { value -> "0x${value.toString(16)}" } ?: "n/a"
+        Log.w(TAG, "Capture queue did not become idle within ${maxWaitMs}ms (last=$lastLabel)")
+        return false
+    }
+
+    /**
      * Poll for events (non-blocking).
      */
     fun pollEvent(timeoutMs: Int = 100): PtpEvent? = transport.readEvent(timeoutMs)

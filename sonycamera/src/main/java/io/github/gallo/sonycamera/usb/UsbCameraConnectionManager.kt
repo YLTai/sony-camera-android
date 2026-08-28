@@ -108,6 +108,7 @@ class UsbCameraConnectionManager(
     private var ptpCamera: SonyPtpCamera? = null
     private var liveviewJob: Job? = null
     private var isLiveviewActive = false
+    @Volatile private var postCaptureResumeDeadlineMs = 0L
 
     // In-flight connect job. Tracking it lets disconnect / detach cancel a
     // connect attempt that's mid-handshake so its coroutine can run its
@@ -309,7 +310,8 @@ class UsbCameraConnectionManager(
             // unplug does. After NEVER seeing a first frame for this many
             // milliseconds, give up and surface ConnectionLost so the UI
             // can prompt the user to unplug/replug.
-            val neverGotFrameFatalMs = 10_000L
+            val postCaptureResume = System.currentTimeMillis() < postCaptureResumeDeadlineMs
+            val neverGotFrameFatalMs = if (postCaptureResume) 18_000L else 10_000L
             val liveviewStartTime = System.currentTimeMillis()
 
             while (isActive && isLiveviewActive) {
@@ -353,6 +355,7 @@ class UsbCameraConnectionManager(
                         consecutiveErrors = 0
                         hasEverGottenFrame = true
                         pipeRecoveryAttempts = 0
+                        postCaptureResumeDeadlineMs = 0L
                         lastFrameTime = System.currentTimeMillis()
 
                         // Focus-area state changes far less often than liveview frames. Poll
@@ -383,10 +386,9 @@ class UsbCameraConnectionManager(
                         // user is prompted to do that.
                         val sinceStart = System.currentTimeMillis() - liveviewStartTime
                         if (!hasEverGottenFrame && sinceStart > neverGotFrameFatalMs) {
-                            Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms — " +
-                                    "camera state wedged. Surfacing ConnectionLost.")
+                            Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms — releasing stale USB session")
                             isLiveviewActive = false
-                            _events.emit(CameraEvent.ConnectionLost)
+                            scope.launch { handleFatalConnectionLoss("Liveview did not recover") }
                             break
                         }
 
@@ -489,25 +491,34 @@ class UsbCameraConnectionManager(
         val camera = ptpCamera
             ?: return@withContext CameraOperationResult.Failure("Camera not connected")
 
-        // Liveview is intentionally NOT stopped here. It keeps running through
-        // initiateCapture()'s autofocus phase so the preview stays live right
-        // up to the shutter — it is torn down inside the shutter callback
-        // below, at the exact full-press moment. PtpTransport serialises every
-        // transaction, so at most one in-flight liveview frame can overlap the
-        // full-press; the capture exposure, readout, and multi-second photo
-        // download that follow run with liveview already stopped.
         val wasLiveview = isLiveviewActive
 
+        // Sony's capture command sequence must not interleave with liveview
+        // GetObject transactions. PtpTransport serialises individual requests,
+        // but the shutter sequence contains sleeps between half/full/release;
+        // without stopping the producer, a liveview GetObject can slip into
+        // those gaps and leave the camera/USB pipe in a bad post-capture state.
+        if (wasLiveview) {
+            isLiveviewActive = false
+            val job = liveviewJob
+            liveviewJob = null
+            if (job != null) {
+                val stopped = kotlinx.coroutines.withTimeoutOrNull(3_000) {
+                    job.cancelAndJoin()
+                    true
+                } ?: false
+                if (!stopped) {
+                    Log.e(TAG, "Liveview did not stop cleanly before capture")
+                    return@withContext CameraOperationResult.Failure(
+                        "Live view is busy — please try the photo again"
+                    )
+                }
+            }
+            // One short quiet period after the final liveview response.
+            delay(80)
+        }
+
         try {
-            // Two attempts max. Each: fire shutter, then wait for the photo to
-            // appear in Sony's PhotoTransferQueue and download it. The most
-            // common failure mode we've seen is the camera silently dropping
-            // the shutter (queue count stays at 0). Re-firing recovers it.
-            // There is no silent fallback to a liveview thumbnail — if we
-            // can't deliver a full-res frame the caller must know.
-            // initiateCapture() invokes its callback at the exact full-press
-            // moment — the real shutter — so the UI flash coincides with the
-            // capture instead of leading it. Signal only once across retries.
             var shutterSignalled = false
             for (attempt in 1..2) {
                 Log.d(TAG, "Capture attempt $attempt/2")
@@ -515,13 +526,8 @@ class UsbCameraConnectionManager(
                 val captureFired = camera.initiateCapture {
                     if (!shutterSignalled) {
                         shutterSignalled = true
-                        // Real shutter moment: stop liveview so it doesn't
-                        // contend with the capture, then flash the UI.
-                        isLiveviewActive = false
-                        liveviewJob?.cancel()
-                        liveviewJob = null
                         _events.tryEmit(CameraEvent.ShutterFired)
-                        Log.d(TAG, "Shutter fired — liveview stopped, flash signalled")
+                        Log.d(TAG, "Shutter fired — capture transaction isolated from liveview")
                     }
                 }
                 if (!captureFired) {
@@ -543,10 +549,6 @@ class UsbCameraConnectionManager(
                     null
                 }
 
-                // Size floor: a real Sony A6600 JPEG is several MB. Anything
-                // under ~200KB is either Sony's error stub or a truncated
-                // transfer — treat as failure so we retry or fail loudly
-                // rather than emitting a visibly-bad photo.
                 if (fullResJpeg != null && fullResJpeg.size >= 200_000) {
                     val bitmap = BitmapFactory.decodeByteArray(fullResJpeg, 0, fullResJpeg.size)
                     if (bitmap != null) {
@@ -566,22 +568,38 @@ class UsbCameraConnectionManager(
                 if (attempt < 2) delay(500)
             }
 
-            // Both attempts failed — surface a clear error. No thumbnail fallback.
             CameraOperationResult.Failure("Photo didn't save — please try again")
         } catch (e: Exception) {
             Log.e(TAG, "Photo capture error", e)
-            // Never surface raw exception text to the user — those messages
-            // are aimed at developers ("bulkTransfer returned -1"). Keep the
-            // user-facing string consistent with the other capture failures.
             CameraOperationResult.Failure("Photo capture failed — please try again")
         } finally {
-            if (wasLiveview) {
+            if (wasLiveview && ptpCamera === camera && _connectionState.value is CameraConnectionState.Ready) {
                 withContext(kotlinx.coroutines.NonCancellable) {
-                    delay(1500)
+                    // D215 stays at 0x80xx while the SDRAM image is still owned
+                    // by the transfer path. Wait for the high bit to clear before
+                    // asking for the liveview object again.
+                    val idle = withContext(Dispatchers.IO) { camera.waitForCaptureIdle(3_500L) }
+                    Log.d(TAG, "Post-capture queue idle=$idle; restarting liveview")
+                    delay(if (idle) 250L else 700L)
+                    postCaptureResumeDeadlineMs = System.currentTimeMillis() + 18_000L
                     startLiveview()
                 }
             }
         }
+    }
+
+    /**
+     * A fatal stream failure is also a connection failure. Release the old
+     * interface/session before telling the UI, otherwise a subsequent Connect
+     * tries to claim a USB interface that this same process still owns.
+     */
+    private fun handleFatalConnectionLoss(reason: String) {
+        if (_connectionState.value is CameraConnectionState.Disconnected) return
+        Log.e(TAG, "Connection lost: $reason")
+        closeUsbResources()
+        _cameraName.value = null
+        _connectionState.value = CameraConnectionState.Disconnected
+        scope.launch { _events.emit(CameraEvent.ConnectionLost) }
     }
 
     override fun disconnect() {

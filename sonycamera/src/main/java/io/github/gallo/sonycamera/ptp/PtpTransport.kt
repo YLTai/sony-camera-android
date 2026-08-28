@@ -334,131 +334,161 @@ class PtpTransport(
     }
 
     /**
-     * Read a PTP response with a short timeout (500ms).
-     * Sony SetControlDeviceB commands may not send a response at all — the camera
-     * accepts the command and executes it but stalls the IN endpoint.
-     * Using a short timeout prevents blocking for 5+ seconds per command.
+     * Sony control commands can acknowledge late. A timed-out response may
+     * therefore arrive during the next PTP transaction. Always match the
+     * response transaction id and discard stale containers instead of letting
+     * one shutter command desynchronise the whole bulk-IN pipe.
      */
-    private fun readResponseQuick(expectedTxId: Int): PtpResponse {
-        val buffer = ByteArray(PtpConstants.HEADER_SIZE + 20)
-        val read = connection.bulkTransfer(bulkIn, buffer, buffer.size, 500)
+    private fun readResponseQuick(expectedTxId: Int): PtpResponse =
+        readMatchingResponse(expectedTxId, 750, logTimeout = false)
 
-        if (read < PtpConstants.HEADER_SIZE) {
-            // No response within 500ms — camera may have accepted command silently
-            return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId)
-        }
-
-        val bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
-        val length = bb.getInt()
-        val type = bb.getShort().toInt() and 0xFFFF
-        val code = bb.getShort().toInt() and 0xFFFF
-        val txId = bb.getInt()
-
-        if (type != PtpConstants.CONTAINER_TYPE_RESPONSE) {
-            if (type == PtpConstants.CONTAINER_TYPE_DATA) {
-                drainData(length, read)
-                return readResponseQuick(expectedTxId)
-            }
-        }
-
-        val paramCount = (read - PtpConstants.HEADER_SIZE) / 4
-        val params = IntArray(paramCount) { bb.getInt() }
-        return PtpResponse(code, txId, params)
-    }
-
-    /**
-     * Read a PTP response container from the device.
-     */
+    /** Read a response container for exactly [expectedTxId]. */
     private fun readResponse(
         expectedTxId: Int,
         timeoutMs: Int = PtpConstants.USB_TIMEOUT_MS
+    ): PtpResponse = readMatchingResponse(expectedTxId, timeoutMs, logTimeout = true)
+
+    private fun readMatchingResponse(
+        expectedTxId: Int,
+        timeoutMs: Int,
+        logTimeout: Boolean
     ): PtpResponse {
-        val buffer = ByteArray(PtpConstants.HEADER_SIZE + 20) // Header + up to 5 params
-        val read = connection.bulkTransfer(bulkIn, buffer, buffer.size, timeoutMs)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val buffer = ByteArray(PtpConstants.HEADER_SIZE + 20)
 
-        if (read < PtpConstants.HEADER_SIZE) {
-            Log.e(TAG, "Short read for response: $read bytes")
-            return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId)
-        }
-
-        val bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
-        val length = bb.getInt()
-        val type = bb.getShort().toInt() and 0xFFFF
-        val code = bb.getShort().toInt() and 0xFFFF
-        val txId = bb.getInt()
-
-        if (type != PtpConstants.CONTAINER_TYPE_RESPONSE) {
-            Log.w(TAG, "Expected response container, got type $type")
-            // Might be a data container — read and discard, then read actual response
-            if (type == PtpConstants.CONTAINER_TYPE_DATA) {
-                drainData(length, read)
-                return readResponse(expectedTxId)
+        while (true) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) {
+                if (logTimeout) Log.e(TAG, "Timed out waiting for response tx=$expectedTxId")
+                return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId)
             }
+
+            val read = connection.bulkTransfer(
+                bulkIn,
+                buffer,
+                buffer.size,
+                remaining.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            )
+            if (read < PtpConstants.HEADER_SIZE) {
+                if (System.currentTimeMillis() >= deadline) {
+                    if (logTimeout) Log.e(TAG, "Short read waiting for response tx=$expectedTxId: $read")
+                    return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId)
+                }
+                continue
+            }
+
+            val bb = ByteBuffer.wrap(buffer, 0, read).order(ByteOrder.LITTLE_ENDIAN)
+            val length = bb.getInt()
+            val type = bb.getShort().toInt() and 0xFFFF
+            val code = bb.getShort().toInt() and 0xFFFF
+            val txId = bb.getInt()
+
+            if (type == PtpConstants.CONTAINER_TYPE_DATA) {
+                // A late/stale data container cannot belong to a command that
+                // is currently waiting only for a response. Drain it fully.
+                drainData(length, read)
+                Log.w(TAG, "Discarded unexpected data container tx=$txId while waiting for tx=$expectedTxId")
+                continue
+            }
+            if (type != PtpConstants.CONTAINER_TYPE_RESPONSE) {
+                Log.w(TAG, "Discarded unexpected container type=$type tx=$txId")
+                continue
+            }
+            if (txId != expectedTxId) {
+                Log.w(TAG, "Discarded stale PTP response tx=$txId while waiting for tx=$expectedTxId")
+                continue
+            }
+
+            val availableParamBytes = (minOf(read, length) - PtpConstants.HEADER_SIZE).coerceAtLeast(0)
+            val paramCount = (availableParamBytes / 4).coerceAtMost(5)
+            val params = IntArray(paramCount) { bb.getInt() }
+            return PtpResponse(code, txId, params)
         }
-
-        // Extract response parameters
-        val paramCount = (read - PtpConstants.HEADER_SIZE) / 4
-        val params = IntArray(paramCount) { bb.getInt() }
-
-        return PtpResponse(code, txId, params)
     }
 
     /**
-     * Read data phase followed by response.
+     * Read data phase followed by response, rejecting stale containers from
+     * previous Sony control transactions.
      */
     private fun readDataAndResponse(expectedTxId: Int): PtpDataResponse {
         val headerBuf = ByteArray(PtpConstants.USB_TRANSFER_BUFFER_SIZE)
-        val read = connection.bulkTransfer(bulkIn, headerBuf, headerBuf.size, PtpConstants.USB_TIMEOUT_MS * 2)
+        val deadline = System.currentTimeMillis() + PtpConstants.USB_TIMEOUT_MS * 2L
 
-        if (read < PtpConstants.HEADER_SIZE) {
-            Log.e(TAG, "Short read for data: $read bytes")
-            return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId, ByteArray(0))
-        }
+        while (true) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) {
+                Log.e(TAG, "Timed out waiting for data tx=$expectedTxId")
+                return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId, ByteArray(0))
+            }
 
-        val bb = ByteBuffer.wrap(headerBuf, 0, read).order(ByteOrder.LITTLE_ENDIAN)
-        val totalLength = bb.getInt()
-        val type = bb.getShort().toInt() and 0xFFFF
-        val code = bb.getShort().toInt() and 0xFFFF
-        val txId = bb.getInt()
-
-        if (type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
-            // No data phase — just a response (e.g., error)
-            return PtpDataResponse(code, txId, ByteArray(0))
-        }
-
-        if (type != PtpConstants.CONTAINER_TYPE_DATA) {
-            Log.w(TAG, "Expected data container, got type $type")
-            return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId, ByteArray(0))
-        }
-
-        // Collect all data
-        val dataSize = totalLength - PtpConstants.HEADER_SIZE
-        val output = ByteArrayOutputStream(dataSize.coerceAtMost(PtpConstants.USB_TRANSFER_BUFFER_SIZE))
-
-        // First chunk (after header)
-        val firstChunkSize = read - PtpConstants.HEADER_SIZE
-        if (firstChunkSize > 0) {
-            output.write(headerBuf, PtpConstants.HEADER_SIZE, firstChunkSize)
-        }
-
-        // Read remaining chunks if data spans multiple USB transfers
-        var totalRead = firstChunkSize
-        while (totalRead < dataSize) {
-            val chunkRead = connection.bulkTransfer(
-                bulkIn, headerBuf, headerBuf.size,
-                PtpConstants.USB_TIMEOUT_MS
+            val read = connection.bulkTransfer(
+                bulkIn,
+                headerBuf,
+                headerBuf.size,
+                remaining.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
             )
-            if (chunkRead <= 0) break
-            output.write(headerBuf, 0, chunkRead)
-            totalRead += chunkRead
+            if (read < PtpConstants.HEADER_SIZE) {
+                Log.e(TAG, "Short read for data tx=$expectedTxId: $read bytes")
+                return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId, ByteArray(0))
+            }
+
+            val bb = ByteBuffer.wrap(headerBuf, 0, read).order(ByteOrder.LITTLE_ENDIAN)
+            val totalLength = bb.getInt()
+            val type = bb.getShort().toInt() and 0xFFFF
+            val code = bb.getShort().toInt() and 0xFFFF
+            val txId = bb.getInt()
+
+            if (type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
+                if (txId != expectedTxId) {
+                    Log.w(TAG, "Discarded stale response tx=$txId while waiting for data tx=$expectedTxId")
+                    continue
+                }
+                // Expected transaction returned an error/no-data response.
+                return PtpDataResponse(code, expectedTxId, ByteArray(0))
+            }
+
+            if (type != PtpConstants.CONTAINER_TYPE_DATA) {
+                Log.w(TAG, "Discarded unexpected container type=$type tx=$txId while waiting for data")
+                continue
+            }
+
+            if (txId != expectedTxId) {
+                Log.w(TAG, "Discarded stale data tx=$txId while waiting for tx=$expectedTxId")
+                drainData(totalLength, read)
+                continue
+            }
+
+            val dataSize = totalLength - PtpConstants.HEADER_SIZE
+            if (dataSize < 0) {
+                return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, expectedTxId, ByteArray(0))
+            }
+            val output = ByteArrayOutputStream(dataSize.coerceAtMost(PtpConstants.USB_TRANSFER_BUFFER_SIZE))
+
+            val firstChunkSize = (read - PtpConstants.HEADER_SIZE).coerceAtMost(dataSize)
+            if (firstChunkSize > 0) {
+                output.write(headerBuf, PtpConstants.HEADER_SIZE, firstChunkSize)
+            }
+
+            var totalRead = firstChunkSize
+            while (totalRead < dataSize) {
+                val chunkRead = connection.bulkTransfer(
+                    bulkIn, headerBuf, headerBuf.size,
+                    PtpConstants.USB_TIMEOUT_MS
+                )
+                if (chunkRead <= 0) break
+                val toWrite = chunkRead.coerceAtMost(dataSize - totalRead)
+                output.write(headerBuf, 0, toWrite)
+                totalRead += toWrite
+            }
+
+            if (totalRead < dataSize) {
+                Log.e(TAG, "Incomplete data tx=$expectedTxId: $totalRead/$dataSize bytes")
+                return PtpDataResponse(PtpConstants.RESP_INCOMPLETE_TRANSFER, expectedTxId, output.toByteArray())
+            }
+
+            val response = readResponse(expectedTxId)
+            return PtpDataResponse(response.responseCode, expectedTxId, output.toByteArray())
         }
-
-        val data = output.toByteArray()
-
-        // Now read the response container
-        val response = readResponse(expectedTxId)
-
-        return PtpDataResponse(response.responseCode, txId, data)
     }
 
     /**
