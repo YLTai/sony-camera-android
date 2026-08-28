@@ -18,6 +18,7 @@ import android.util.Log
 import io.github.gallo.sonycamera.CameraConnectionManager
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraExposureSetting
 import io.github.gallo.sonycamera.CameraFocusFrame
 import io.github.gallo.sonycamera.CameraFocusFrameInfo
 import io.github.gallo.sonycamera.CameraOperationResult
@@ -65,7 +66,7 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
-        private const val FOCUS_AREA_POLL_INTERVAL_MS = 1_000L
+        private const val EXPOSURE_POLL_INTERVAL_MS = 1_200L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -291,7 +292,7 @@ class UsbCameraConnectionManager(
             var frameCount = 0L
             var errorCount = 0L
             var lastLogTime = System.currentTimeMillis()
-            var lastFocusAreaPollTime = 0L
+            var lastExposurePollTime = 0L
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
             var pipeRecoveryAttempts = 0
@@ -358,15 +359,14 @@ class UsbCameraConnectionManager(
                         postCaptureResumeDeadlineMs = 0L
                         lastFrameTime = System.currentTimeMillis()
 
-                        // Focus-area state changes far less often than liveview frames. Poll
-                        // once per second to keep the extra 0x9209 round trip inexpensive.
-                        // Emit every successful read so recreated UI collectors recover state.
-                        val focusPollNow = System.currentTimeMillis()
-                        if (focusPollNow - lastFocusAreaPollTime >= FOCUS_AREA_POLL_INTERVAL_MS) {
-                            lastFocusAreaPollTime = focusPollNow
-                            ptpCamera?.probeFocusArea()?.let { probe ->
-                                _events.emit(CameraEvent.FocusDebug(probe.debug))
-                                probe.focusAreaCode?.let { _events.emit(CameraEvent.FocusAreaUpdated(it)) }
+                        // Exposure values change relatively slowly. One Sony 0x9209 snapshot
+                        // supplies aperture, shutter and ISO without shrinking liveview throughput
+                        // with three independent property round trips.
+                        val exposurePollNow = System.currentTimeMillis()
+                        if (exposurePollNow - lastExposurePollTime >= EXPOSURE_POLL_INTERVAL_MS) {
+                            lastExposurePollTime = exposurePollNow
+                            ptpCamera?.readExposureState()?.let { exposure ->
+                                _events.emit(CameraEvent.ExposureUpdated(exposure))
                             }
                         }
 
@@ -473,6 +473,18 @@ class UsbCameraConnectionManager(
             _events.emit(CameraEvent.FocusDebug(message))
             CameraOperationResult.Failure(message)
         }
+    }
+
+    override suspend fun adjustExposure(
+        setting: CameraExposureSetting,
+        direction: Int
+    ): CameraOperationResult = withContext(Dispatchers.IO) {
+        val camera = ptpCamera
+            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
+        val result = camera.adjustExposure(setting, direction)
+        _events.emit(CameraEvent.ExposureUpdated(result.state))
+        if (result.success) CameraOperationResult.Success
+        else CameraOperationResult.Failure(result.message ?: "Exposure change failed")
     }
 
     override suspend fun takePhoto(): CameraOperationResult = try {
@@ -895,6 +907,10 @@ class UsbCameraConnectionManager(
 
             _cameraName.value = localCamera.deviceName ?: "Sony Camera (USB)"
             _connectionState.value = CameraConnectionState.Ready
+
+            // Discover exposure controls before liveview begins, then seed the
+            // monitor top bar with the exact current values and choices.
+            _events.emit(CameraEvent.ExposureUpdated(localCamera.readExposureState(forceDescriptorProbe = true)))
 
             Log.d(TAG, "USB camera connected: ${localCamera.deviceName}")
 

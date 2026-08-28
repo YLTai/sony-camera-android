@@ -53,6 +53,39 @@ data class CameraFocusFrameInfo(
     val frames: List<CameraFocusFrame>
 )
 
+/** Exposure controls surfaced by the monitor UI. */
+enum class CameraExposureSetting {
+    APERTURE,
+    SHUTTER_SPEED,
+    ISO
+}
+
+/** One camera-reported exposure choice. [rawValue] is the exact PTP value. */
+data class CameraExposureOption(
+    val rawValue: Long,
+    val label: String
+)
+
+/** Current value and the camera-supported choices for one exposure control. */
+data class CameraExposureProperty(
+    val current: CameraExposureOption?,
+    val options: List<CameraExposureOption>,
+    val writable: Boolean
+)
+
+/** Exposure snapshot used by the monitor top bar. */
+data class CameraExposureState(
+    val aperture: CameraExposureProperty,
+    val shutterSpeed: CameraExposureProperty,
+    val iso: CameraExposureProperty
+) {
+    fun property(setting: CameraExposureSetting): CameraExposureProperty = when (setting) {
+        CameraExposureSetting.APERTURE -> aperture
+        CameraExposureSetting.SHUTTER_SPEED -> shutterSpeed
+        CameraExposureSetting.ISO -> iso
+    }
+}
+
 /**
  * Events emitted by the camera connection.
  */
@@ -75,6 +108,9 @@ sealed class CameraEvent {
 
     /** Real focus frames returned by the camera in the current live-view dataset. */
     data class FocusFramesUpdated(val info: CameraFocusFrameInfo) : CameraEvent()
+
+    /** Current aperture / shutter / ISO values and selectable camera steps. */
+    data class ExposureUpdated(val state: CameraExposureState) : CameraEvent()
 
     /**
      * The shutter is firing now — the capture sequence has just begun.
@@ -124,6 +160,12 @@ interface CameraConnectionManager {
 
     /** Diagnostic: write Sony AF Area Position to the protocol center (320, 240). */
     suspend fun testAfCenter(): CameraOperationResult
+
+    /** Step one exposure control to the previous/next camera-supported value. */
+    suspend fun adjustExposure(
+        setting: CameraExposureSetting,
+        direction: Int
+    ): CameraOperationResult
 
     /** Disconnect from the camera. */
     fun disconnect()

@@ -1,14 +1,12 @@
 package io.github.gallo.sonycamera.demo
 
 import android.graphics.Bitmap
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -16,7 +14,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -25,13 +22,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,21 +39,23 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraExposureProperty
+import io.github.gallo.sonycamera.CameraExposureSetting
+import io.github.gallo.sonycamera.CameraExposureState
 import io.github.gallo.sonycamera.CameraFocusFrame
 import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.service.CameraConnectionClient
@@ -67,162 +63,173 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.min
 
-private val Accent = Color(0xFFFF5A3C)
-private val AfGreen = Color(0xFF36D399)
-private val DebugGold = Color(0xFFFFD166)
-private val Ink = Color(0xFF08090B)
-private val Rail = Color(0xFF111216)
+private val Accent = Color(0xFFFF4D3D)
+private val AfGreen = Color(0xFF3DDC97)
+private val Ink = Color(0xFF07080A)
+private val Glass = Color(0xCC111319)
+private val SoftGlass = Color(0x99111319)
 
-/** Landscape-first camera controller with touch AF. */
+/** Full-screen landscape monitor UI. Controls overlay the image instead of resizing it. */
 @Composable
 fun CameraScreen(camera: CameraConnectionClient) {
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent, background = Ink)) {
         Surface(color = Ink, modifier = Modifier.fillMaxSize()) {
             val scope = rememberCoroutineScope()
             val state by camera.connectionState.collectAsStateWithLifecycle()
-            val name by camera.cameraName.collectAsStateWithLifecycle()
+            val cameraName by camera.cameraName.collectAsStateWithLifecycle()
 
             var frame by remember { mutableStateOf<Bitmap?>(null) }
-            var captured by remember { mutableStateOf<Bitmap?>(null) }
+            var capturedThumb by remember { mutableStateOf<Bitmap?>(null) }
             var flash by remember { mutableStateOf(false) }
             var lastError by remember { mutableStateOf<String?>(null) }
-            var focusAreaCode by remember { mutableStateOf<Int?>(null) }
-            var focusDebug by remember { mutableStateOf("waiting for first AF probe…") }
-            var focusEventCount by remember { mutableStateOf(0) }
-            var liveFrameCount by remember { mutableStateOf(0L) }
-            var afTargetX by remember { mutableStateOf<Int?>(null) }
-            var afTargetY by remember { mutableStateOf<Int?>(null) }
-            var afBusy by remember { mutableStateOf(false) }
             var focusFrames by remember { mutableStateOf<List<CameraFocusFrame>>(emptyList()) }
+            var afBusy by remember { mutableStateOf(false) }
+            var peakingEnabled by remember { mutableStateOf(false) }
+            var exposure by remember { mutableStateOf<CameraExposureState?>(null) }
+            var activeExposure by remember { mutableStateOf<CameraExposureSetting?>(null) }
 
             LaunchedEffect(camera) {
-                camera.liveviewFrames.collect { bitmap ->
-                    frame = bitmap
-                    liveFrameCount++
-                }
+                camera.liveviewFrames.collect { bitmap -> frame = bitmap }
             }
 
             LaunchedEffect(camera) {
                 camera.events.collect { event ->
                     when (event) {
-                        is CameraEvent.PhotoCaptured -> captured = event.bitmap
+                        is CameraEvent.PhotoCaptured -> capturedThumb = event.bitmap
                         is CameraEvent.ShutterFired -> flash = true
-                        is CameraEvent.FocusAreaUpdated -> {
-                            focusAreaCode = event.rawValue
-                            focusEventCount++
-                        }
-                        is CameraEvent.FocusDebug -> focusDebug = event.message
-                        is CameraEvent.AfTargetUpdated -> {
-                            afTargetX = event.x
-                            afTargetY = event.y
-                        }
-                        is CameraEvent.FocusFramesUpdated -> {
-                            focusFrames = event.info.frames
-                            focusEventCount++
-                        }
+                        is CameraEvent.FocusFramesUpdated -> focusFrames = event.info.frames
+                        is CameraEvent.ExposureUpdated -> exposure = event.state
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
+                        else -> Unit
                     }
                 }
             }
 
             LaunchedEffect(state) {
                 if (state !is CameraConnectionState.Ready) {
-                    focusAreaCode = null
-                    afTargetX = null
-                    afTargetY = null
                     focusFrames = emptyList()
+                    exposure = null
+                    activeExposure = null
                 }
             }
 
             LaunchedEffect(flash) {
                 if (flash) {
-                    delay(60)
+                    delay(55)
                     flash = false
                 }
             }
 
-            fun requestAf(x: Int, y: Int, centerTest: Boolean = false) {
+            LaunchedEffect(capturedThumb) {
+                if (capturedThumb != null) {
+                    delay(1400)
+                    capturedThumb = null
+                }
+            }
+
+            fun requestAf(x: Int, y: Int) {
                 if (afBusy || state !is CameraConnectionState.Ready) return
-                afTargetX = x.coerceIn(0, 639)
-                afTargetY = y.coerceIn(0, 479)
                 afBusy = true
                 scope.launch {
-                    val result = if (centerTest) camera.testAfCenter() else camera.setAfPoint(x, y)
+                    val result = camera.setAfPoint(x.coerceIn(0, 639), y.coerceIn(0, 479))
                     if (result is CameraOperationResult.Failure) lastError = result.message
                     afBusy = false
                 }
             }
 
-            Box(Modifier.fillMaxSize()) {
-                Row(Modifier.fillMaxSize()) {
-                    LeftRail(
-                        state = state,
-                        cameraName = name,
-                        liveFrameCount = liveFrameCount,
-                        frame = frame,
-                        focusAreaCode = focusAreaCode,
-                        focusEventCount = focusEventCount,
-                        focusDebug = focusDebug,
-                        afTargetX = afTargetX,
-                        afTargetY = afTargetY,
-                        focusFrames = focusFrames,
-                        onConnect = { lastError = null; camera.connectToCamera() },
-                        onDisconnect = { camera.disconnect() },
-                        modifier = Modifier.width(218.dp).fillMaxHeight()
-                    )
+            fun adjust(setting: CameraExposureSetting, direction: Int) {
+                if (state !is CameraConnectionState.Ready) return
+                scope.launch {
+                    val result = camera.adjustExposure(setting, direction)
+                    if (result is CameraOperationResult.Failure) lastError = result.message
+                }
+            }
 
-                    PreviewPane(
-                        state = state,
-                        frame = frame,
-                        focusFrames = focusFrames,
-                        afBusy = afBusy,
-                        onAfPoint = { x, y -> requestAf(x, y) },
-                        modifier = Modifier.weight(1f).fillMaxHeight()
-                    )
+            Box(Modifier.fillMaxSize().background(Color.Black)) {
+                PreviewPane(
+                    state = state,
+                    frame = frame,
+                    focusFrames = focusFrames,
+                    peakingEnabled = peakingEnabled,
+                    afBusy = afBusy,
+                    onAfPoint = ::requestAf,
+                    modifier = Modifier.fillMaxSize()
+                )
 
-                    RightRail(
-                        state = state,
-                        afBusy = afBusy,
-                        onAfCenter = { requestAf(320, 240, centerTest = true) },
-                        onCapture = { scope.launch { camera.takePhoto() } },
-                        onConnect = { lastError = null; camera.connectToCamera() },
-                        modifier = Modifier.width(152.dp).fillMaxHeight()
+                MonitorTopBar(
+                    state = state,
+                    cameraName = cameraName,
+                    exposure = exposure,
+                    activeExposure = activeExposure,
+                    peakingEnabled = peakingEnabled,
+                    onExposureClick = { setting ->
+                        activeExposure = if (activeExposure == setting) null else setting
+                    },
+                    onPeakingToggle = { peakingEnabled = !peakingEnabled },
+                    onAfCenter = { requestAf(320, 240) },
+                    onConnect = { lastError = null; camera.connectToCamera() },
+                    onDisconnect = { camera.disconnect() },
+                    modifier = Modifier.align(Alignment.TopCenter)
+                )
+
+                activeExposure?.let { setting ->
+                    ExposureAdjuster(
+                        setting = setting,
+                        property = exposure?.property(setting),
+                        onStep = { direction -> adjust(setting, direction) },
+                        onClose = { activeExposure = null },
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 66.dp)
+                    )
+                }
+
+                if (state is CameraConnectionState.Ready) {
+                    ShutterButton(
+                        onClick = { scope.launch { camera.takePhoto() } },
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .padding(end = 18.dp)
+                    )
+                }
+
+                capturedThumb?.let { bitmap ->
+                    CaptureThumbnail(
+                        bitmap = bitmap,
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(14.dp)
                     )
                 }
 
                 val flashAlpha by animateFloatAsState(
-                    targetValue = if (flash) 0.85f else 0f,
-                    animationSpec = tween(durationMillis = if (flash) 0 else 220),
-                    label = "flash"
+                    targetValue = if (flash) 0.82f else 0f,
+                    animationSpec = tween(durationMillis = if (flash) 0 else 190),
+                    label = "captureFlash"
                 )
                 if (flashAlpha > 0f) {
                     Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = flashAlpha)))
                 }
 
-                lastError?.let { msg ->
-                    LaunchedEffect(msg) { delay(3500); lastError = null }
+                lastError?.let { message ->
+                    LaunchedEffect(message) {
+                        delay(3200)
+                        lastError = null
+                    }
                     Text(
-                        text = msg,
+                        text = message,
                         color = Color.White,
-                        fontSize = 13.sp,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
                         modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 18.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Accent.copy(alpha = 0.92f))
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 18.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.Black.copy(alpha = 0.78f))
+                            .border(1.dp, Accent.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
                             .padding(horizontal = 14.dp, vertical = 8.dp)
                     )
-                }
-
-                AnimatedVisibility(
-                    visible = captured != null,
-                    enter = fadeIn(),
-                    exit = fadeOut()
-                ) {
-                    captured?.let { shot ->
-                        CapturedReview(shot, onDismiss = { captured = null })
-                    }
                 }
             }
         }
@@ -234,6 +241,7 @@ private fun PreviewPane(
     state: CameraConnectionState,
     frame: Bitmap?,
     focusFrames: List<CameraFocusFrame>,
+    peakingEnabled: Boolean,
     afBusy: Boolean,
     onAfPoint: (Int, Int) -> Unit,
     modifier: Modifier = Modifier
@@ -253,17 +261,24 @@ private fun PreviewPane(
                     if (!rect.contains(tap)) return@detectTapGestures
                     val nx = ((tap.x - rect.left) / rect.width).coerceIn(0f, 1f)
                     val ny = ((tap.y - rect.top) / rect.height).coerceIn(0f, 1f)
-                    val sonyX = (nx * 639f).toInt().coerceIn(0, 639)
-                    val sonyY = (ny * 479f).toInt().coerceIn(0, 479)
-                    onAfPoint(sonyX, sonyY)
+                    onAfPoint((nx * 639f).toInt(), (ny * 479f).toInt())
                 }
-            }
+            },
+        contentAlignment = Alignment.Center
     ) {
         if (frame != null) {
+            // Fill the entire screen allocation. ContentScale.Fit keeps the complete
+            // sensor image visible and centers any unavoidable letterboxing evenly.
             Image(
                 bitmap = frame.asImageBitmap(),
-                contentDescription = "Live view — tap to focus",
+                contentDescription = "Sony camera live view",
                 contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            FocusPeakingOverlay(
+                source = frame,
+                enabled = peakingEnabled,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -276,20 +291,335 @@ private fun PreviewPane(
                 )
             }
 
-            Text(
-                text = if (afBusy) "Focusing…" else "Tap preview to focus",
-                color = Color.White,
-                fontSize = 11.sp,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 10.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
-            )
+            if (afBusy) {
+                Text(
+                    "AF",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 14.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black.copy(alpha = 0.58f))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                )
+            }
         } else {
             PreviewPlaceholder(state)
         }
+    }
+}
+
+@Composable
+private fun MonitorTopBar(
+    state: CameraConnectionState,
+    cameraName: String?,
+    exposure: CameraExposureState?,
+    activeExposure: CameraExposureSetting?,
+    peakingEnabled: Boolean,
+    onExposureClick: (CameraExposureSetting) -> Unit,
+    onPeakingToggle: () -> Unit,
+    onAfCenter: () -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(58.dp)
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color.Black.copy(alpha = 0.82f), Color.Black.copy(alpha = 0.38f))
+                )
+            )
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val ready = state is CameraConnectionState.Ready
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(if (ready) AfGreen else Color(0xFF777A82))
+            )
+            Spacer(Modifier.width(7.dp))
+            Column {
+                Text(
+                    text = cameraName ?: if (ready) "Sony Camera" else "Monitor",
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = if (ready) "LIVE" else connectionLabel(state),
+                    color = if (ready) AfGreen else Color.White.copy(alpha = 0.55f),
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ExposurePill(
+                title = "IRIS",
+                property = exposure?.aperture,
+                active = activeExposure == CameraExposureSetting.APERTURE,
+                enabled = state is CameraConnectionState.Ready,
+                onClick = { onExposureClick(CameraExposureSetting.APERTURE) }
+            )
+            ExposurePill(
+                title = "SHUTTER",
+                property = exposure?.shutterSpeed,
+                active = activeExposure == CameraExposureSetting.SHUTTER_SPEED,
+                enabled = state is CameraConnectionState.Ready,
+                onClick = { onExposureClick(CameraExposureSetting.SHUTTER_SPEED) }
+            )
+            ExposurePill(
+                title = "ISO",
+                property = exposure?.iso,
+                active = activeExposure == CameraExposureSetting.ISO,
+                enabled = state is CameraConnectionState.Ready,
+                onClick = { onExposureClick(CameraExposureSetting.ISO) }
+            )
+        }
+
+        Row(
+            modifier = Modifier.weight(1f),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (state is CameraConnectionState.Ready) {
+                TinyControl(
+                    text = "PEAK",
+                    active = peakingEnabled,
+                    onClick = onPeakingToggle
+                )
+                Spacer(Modifier.width(5.dp))
+                TinyControl(text = "AF-C", active = false, onClick = onAfCenter)
+                Spacer(Modifier.width(5.dp))
+                TinyControl(text = "LINK", active = true, onClick = onDisconnect)
+            } else if (state is CameraConnectionState.Disconnected || state is CameraConnectionState.Error) {
+                TinyControl(text = "CONNECT", active = true, onClick = onConnect, width = 66.dp)
+            } else {
+                CircularProgressIndicator(
+                    color = Color.White.copy(alpha = 0.8f),
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExposurePill(
+    title: String,
+    property: CameraExposureProperty?,
+    active: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val current = property?.current?.label ?: "--"
+    val canClick = enabled && property?.current != null
+    val outline = if (active) Accent.copy(alpha = 0.9f) else Color.White.copy(alpha = 0.14f)
+    Column(
+        modifier = Modifier
+            .width(78.dp)
+            .height(44.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (active) Accent.copy(alpha = 0.15f) else SoftGlass)
+            .border(1.dp, outline, RoundedCornerShape(10.dp))
+            .clickable(enabled = canClick, onClick = onClick)
+            .padding(horizontal = 7.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            title,
+            color = Color.White.copy(alpha = if (canClick) 0.54f else 0.28f),
+            fontSize = 7.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            current,
+            color = Color.White.copy(alpha = if (canClick) 1f else 0.42f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun TinyControl(
+    text: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    width: androidx.compose.ui.unit.Dp = 48.dp
+) {
+    Box(
+        modifier = Modifier
+            .width(width)
+            .height(32.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (active) Accent.copy(alpha = 0.18f) else SoftGlass)
+            .border(
+                1.dp,
+                if (active) Accent.copy(alpha = 0.65f) else Color.White.copy(alpha = 0.13f),
+                RoundedCornerShape(9.dp)
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text,
+            color = if (active) Color(0xFFFF6A5D) else Color.White.copy(alpha = 0.84f),
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun ExposureAdjuster(
+    setting: CameraExposureSetting,
+    property: CameraExposureProperty?,
+    onStep: (Int) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val current = property?.current?.label ?: "--"
+    val count = property?.options?.size ?: 0
+    val writable = property?.writable == true
+
+    Surface(
+        modifier = modifier,
+        color = Glass,
+        shape = RoundedCornerShape(15.dp),
+        shadowElevation = 10.dp,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
+    ) {
+        Row(
+            modifier = Modifier.height(62.dp).padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            StepButton("−", enabled = writable) { onStep(-1) }
+            Column(
+                modifier = Modifier.width(126.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    settingTitle(setting),
+                    color = Color.White.copy(alpha = 0.48f),
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(current, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (writable) "$count CAMERA STEPS" else "LOCKED IN THIS MODE",
+                    color = if (writable) Color.White.copy(alpha = 0.38f) else Accent.copy(alpha = 0.82f),
+                    fontSize = 7.sp
+                )
+            }
+            StepButton("+", enabled = writable) { onStep(1) }
+            Box(
+                modifier = Modifier
+                    .padding(start = 3.dp)
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable(onClick = onClose),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("×", color = Color.White.copy(alpha = 0.55f), fontSize = 16.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StepButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(alpha = if (enabled) 0.10f else 0.035f))
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text,
+            color = Color.White.copy(alpha = if (enabled) 0.95f else 0.25f),
+            fontSize = 25.sp,
+            fontWeight = FontWeight.Light
+        )
+    }
+}
+
+@Composable
+private fun ShutterButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    var pressed by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (pressed) 0.88f else 1f, label = "shutterScale")
+    LaunchedEffect(pressed) {
+        if (pressed) {
+            delay(120)
+            pressed = false
+        }
+    }
+    Box(
+        modifier = modifier
+            .size(78.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.34f))
+            .border(1.dp, Color.White.copy(alpha = 0.34f), CircleShape)
+            .clickable {
+                pressed = true
+                onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier
+                .size((58 * scale).dp)
+                .clip(CircleShape)
+                .background(Color.White.copy(alpha = 0.90f))
+                .border(2.dp, Color.White, CircleShape)
+        )
+    }
+}
+
+@Composable
+private fun CaptureThumbnail(bitmap: Bitmap, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.Black.copy(alpha = 0.55f))
+            .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(10.dp))
+            .padding(4.dp)
+    ) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = "Last capture",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.width(116.dp).height(70.dp).clip(RoundedCornerShape(7.dp))
+        )
+        Text(
+            "CAPTURED",
+            color = AfGreen,
+            fontSize = 7.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(start = 3.dp, top = 2.dp, bottom = 1.dp)
+        )
     }
 }
 
@@ -306,7 +636,6 @@ private fun CameraFocusOverlay(
 
         frames.forEach { frame ->
             if (frame.xDenominator <= 0L || frame.yDenominator <= 0L) return@forEach
-
             val centerX = imageRect.left + imageRect.width * frame.centerXNormalized
             val centerY = imageRect.top + imageRect.height * frame.centerYNormalized
             val frameWidth = imageRect.width * frame.widthNormalized
@@ -318,23 +647,17 @@ private fun CameraFocusOverlay(
             val top = centerY - frameHeight / 2f
             val bottom = centerY + frameHeight / 2f
             val color = when (frame.state) {
-                0x0002 -> AfGreen                  // Focused
-                0x0003, 0x0004 -> DebugGold       // Selection / moving
-                0x0005 -> Accent                   // Range limit
-                else -> Color.White                // Not focused / other
+                0x0002 -> AfGreen
+                0x0005 -> Accent
+                else -> Color.White.copy(alpha = 0.85f)
             }
-            val stroke = if (isAssistFocusFrame(frame.type)) 1.35.dp.toPx() else 2.15.dp.toPx()
+            val stroke = 1.7.dp.toPx()
+            val corner = (min(frameWidth, frameHeight) * 0.28f).coerceIn(4.dp.toPx(), 18.dp.toPx())
 
             if (frame.type == 0x0010) {
-                // Sony's protocol explicitly identifies this focus frame as Cross.
                 drawLine(color, Offset(left, centerY), Offset(right, centerY), stroke)
                 drawLine(color, Offset(centerX, top), Offset(centerX, bottom), stroke)
             } else {
-                // Sony bodies render most AF regions as corner brackets. The
-                // geometry itself (center/width/height) is camera supplied.
-                val corner = (min(frameWidth, frameHeight) * 0.28f)
-                    .coerceIn(4.dp.toPx(), 18.dp.toPx())
-
                 drawLine(color, Offset(left, top), Offset(left + corner, top), stroke)
                 drawLine(color, Offset(left, top), Offset(left, top + corner), stroke)
                 drawLine(color, Offset(right, top), Offset(right - corner, top), stroke)
@@ -348,17 +671,8 @@ private fun CameraFocusOverlay(
     }
 }
 
-private fun isAssistFocusFrame(type: Int): Boolean = when (type) {
-    0x0007, // ContrastFlexibleAssist
-    0x000C, // DualAFAssist
-    0x000E -> true // NonDualAFAssist
-    else -> false
-}
-
 private fun fittedImageRect(container: IntSize, imageWidth: Int, imageHeight: Int): Rect {
-    if (container.width <= 0 || container.height <= 0 || imageWidth <= 0 || imageHeight <= 0) {
-        return Rect.Zero
-    }
+    if (container.width <= 0 || container.height <= 0 || imageWidth <= 0 || imageHeight <= 0) return Rect.Zero
     val scale = min(
         container.width.toFloat() / imageWidth.toFloat(),
         container.height.toFloat() / imageHeight.toFloat()
@@ -371,286 +685,43 @@ private fun fittedImageRect(container: IntSize, imageWidth: Int, imageHeight: In
 }
 
 @Composable
-private fun LeftRail(
-    state: CameraConnectionState,
-    cameraName: String?,
-    liveFrameCount: Long,
-    frame: Bitmap?,
-    focusAreaCode: Int?,
-    focusEventCount: Int,
-    focusDebug: String,
-    afTargetX: Int?,
-    afTargetY: Int?,
-    focusFrames: List<CameraFocusFrame>,
-    onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier.background(Rail).padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        StatusBlock(state, cameraName)
-
-        Text("CAMERA AF", color = DebugGold, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-        val primaryFrame = focusFrames.minByOrNull { it.priority }
-        if (primaryFrame != null) {
-            val cameraX = (primaryFrame.centerXNormalized * 639f).toInt().coerceIn(0, 639)
-            val cameraY = (primaryFrame.centerYNormalized * 479f).toInt().coerceIn(0, 479)
-            val cameraW = (primaryFrame.widthNormalized * 640f).toInt().coerceAtLeast(1)
-            val cameraH = (primaryFrame.heightNormalized * 480f).toInt().coerceAtLeast(1)
-            Text(
-                "${focusFrameTypeLabel(primaryFrame.type)} · ${focusFrameStateLabel(primaryFrame.state)}",
-                color = Color.White,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                "X $cameraX  Y $cameraY   ${cameraW}×${cameraH}   frames=${focusFrames.size}",
-                color = Color.White.copy(alpha = 0.72f),
-                fontSize = 9.sp
-            )
-        } else {
-            Text("Waiting for FocalFrameInfo…", color = Color.White.copy(alpha = 0.68f), fontSize = 10.sp)
-        }
-        Text(
-            "Mode: ${focusAreaCode?.let(::focusAreaLabel) ?: "unknown"}",
-            color = Color.White.copy(alpha = 0.68f),
-            fontSize = 9.sp
-        )
-        Text(
-            if (afTargetX != null && afTargetY != null) "Last command: X $afTargetX  Y $afTargetY" else "Tap preview to set AF target",
-            color = Color.White.copy(alpha = 0.48f),
-            fontSize = 8.sp
-        )
-
-        Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.10f)))
-
-        Text("AF DEBUG", color = DebugGold, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-        Text(
-            "frames=$liveFrameCount  ${frame?.width ?: 0}x${frame?.height ?: 0}  areaEvents=$focusEventCount",
-            color = Color.White.copy(alpha = 0.85f),
-            fontSize = 9.sp
-        )
-        Text(
-            focusDebug,
-            color = Color.White.copy(alpha = 0.58f),
-            fontSize = 8.sp,
-            maxLines = 9
-        )
-
-        Spacer(Modifier.weight(1f))
-
-        when (state) {
-            is CameraConnectionState.Ready -> TextButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) {
-                Text("Disconnect", color = Color.White.copy(alpha = 0.72f))
-            }
-            is CameraConnectionState.Disconnected,
-            is CameraConnectionState.Error -> Button(
-                onClick = onConnect,
-                colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Connect")
-            }
-            else -> CircularProgressIndicator(
-                color = Accent,
-                modifier = Modifier.align(Alignment.CenterHorizontally).size(28.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun RightRail(
-    state: CameraConnectionState,
-    afBusy: Boolean,
-    onAfCenter: () -> Unit,
-    onCapture: () -> Unit,
-    onConnect: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier.background(Rail).padding(horizontal = 12.dp, vertical = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        if (state is CameraConnectionState.Ready) {
-            Button(
-                onClick = onAfCenter,
-                enabled = !afBusy,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.13f)),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth().height(44.dp)
-            ) {
-                Text("AF CENTER", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-            }
-
-            Spacer(Modifier.weight(1f))
-            ShutterButton(onClick = onCapture)
-            Text("CAPTURE", color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp)
-            Spacer(Modifier.weight(1f))
-        } else if (state is CameraConnectionState.Disconnected || state is CameraConnectionState.Error) {
-            Spacer(Modifier.weight(1f))
-            Button(
-                onClick = onConnect,
-                colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Connect", fontSize = 11.sp)
-            }
-            Spacer(Modifier.weight(1f))
-        } else {
-            Spacer(Modifier.weight(1f))
-            CircularProgressIndicator(color = Accent, modifier = Modifier.size(30.dp))
-            Spacer(Modifier.weight(1f))
-        }
-    }
-}
-
-@Composable
-private fun StatusBlock(state: CameraConnectionState, cameraName: String?) {
-    val (dot, label) = when (state) {
-        is CameraConnectionState.Ready -> AfGreen to (cameraName ?: "Connected")
-        is CameraConnectionState.Connecting -> DebugGold to "Connecting"
-        is CameraConnectionState.Initializing -> DebugGold to "Initializing"
-        is CameraConnectionState.Scanning -> DebugGold to "Scanning"
-        is CameraConnectionState.Error -> Accent to "Error"
-        is CameraConnectionState.Disconnected -> Color(0xFF7A7A85) to "Disconnected"
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(9.dp).clip(CircleShape).background(dot))
-        Spacer(Modifier.width(8.dp))
-        Text(label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-private fun focusFrameTypeLabel(type: Int): String = when (type) {
-    0x0001 -> "Phase Detect AF Sensor"
-    0x0002 -> "Phase Detect Image Sensor"
-    0x0003 -> "Wide"
-    0x0004 -> "Zone"
-    0x0005 -> "Central Emphasis"
-    0x0006 -> "Flexible Main"
-    0x0007 -> "Flexible Assist"
-    0x0008 -> "Contrast"
-    0x0009 -> "Contrast Upper"
-    0x000A -> "Contrast Lower"
-    0x000B -> "Dual AF Main"
-    0x000C -> "Dual AF Assist"
-    0x000D -> "Non-Dual AF Main"
-    0x000E -> "Non-Dual AF Assist"
-    0x000F -> "Frame Somewhere"
-    0x0010 -> "Cross"
-    else -> "Type 0x${type.toString(16).uppercase().padStart(4, '0')}"
-}
-
-private fun focusFrameStateLabel(state: Int): String = when (state) {
-    0x0001 -> "Not focused"
-    0x0002 -> "Focused"
-    0x0003 -> "Selected"
-    0x0004 -> "Moving"
-    0x0005 -> "Range limit"
-    0x0006 -> "Registration AF"
-    0x0007 -> "Island"
-    else -> "State 0x${state.toString(16).uppercase().padStart(4, '0')}"
-}
-
-private fun focusAreaLabel(code: Int): String = when (code) {
-    0x0001 -> "Wide"
-    0x0002 -> "Zone"
-    0x0003 -> "Center"
-    0x0101 -> "Flexible Spot S"
-    0x0102 -> "Flexible Spot M"
-    0x0103 -> "Flexible Spot L"
-    0x0104 -> "Expand Flexible Spot"
-    0x0201 -> "Lock-on: Wide"
-    0x0202 -> "Lock-on: Zone"
-    0x0203 -> "Lock-on: Center"
-    0x0204 -> "Lock-on: Flexible Spot S"
-    0x0205 -> "Lock-on: Flexible Spot M"
-    0x0206 -> "Lock-on: Flexible Spot L"
-    0x0207 -> "Lock-on: Expand Flexible Spot"
-    else -> "Unknown 0x${code.toString(16).uppercase().padStart(4, '0')}"
-}
-
-@Composable
 private fun PreviewPlaceholder(state: CameraConnectionState) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         when (state) {
-            is CameraConnectionState.Ready ->
-                Text("Waiting for live view…", color = Color.White.copy(alpha = 0.6f), fontSize = 15.sp)
+            is CameraConnectionState.Ready -> Text(
+                "Waiting for live view…",
+                color = Color.White.copy(alpha = 0.48f),
+                fontSize = 14.sp
+            )
             is CameraConnectionState.Connecting,
             is CameraConnectionState.Initializing,
             is CameraConnectionState.Scanning -> CircularProgressIndicator(color = Accent)
             is CameraConnectionState.Error -> Text(
                 state.message,
-                color = Color.White.copy(alpha = 0.75f),
-                fontSize = 13.sp,
-                modifier = Modifier.padding(horizontal = 30.dp)
+                color = Color.White.copy(alpha = 0.72f),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 38.dp)
             )
             is CameraConnectionState.Disconnected -> Text(
-                "Plug in a Sony camera over USB",
-                color = Color.White.copy(alpha = 0.65f),
-                fontSize = 14.sp
+                "Connect Sony camera over USB",
+                color = Color.White.copy(alpha = 0.48f),
+                fontSize = 13.sp
             )
         }
     }
 }
 
-@Composable
-private fun ShutterButton(onClick: () -> Unit) {
-    var pressed by remember { mutableStateOf(false) }
-    val scale by animateFloatAsState(if (pressed) 0.9f else 1f, label = "shutterScale")
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(90.dp)
-            .clip(CircleShape)
-            .background(Color.White.copy(alpha = 0.18f))
-            .clickable {
-                pressed = true
-                onClick()
-            }
-    ) {
-        Box(
-            Modifier
-                .size((74 * scale).dp)
-                .clip(CircleShape)
-                .background(Color.White)
-        )
-    }
-    LaunchedEffect(pressed) {
-        if (pressed) {
-            delay(120)
-            pressed = false
-        }
-    }
+private fun connectionLabel(state: CameraConnectionState): String = when (state) {
+    is CameraConnectionState.Ready -> "LIVE"
+    is CameraConnectionState.Connecting -> "CONNECTING"
+    is CameraConnectionState.Initializing -> "INITIALIZING"
+    is CameraConnectionState.Scanning -> "SCANNING"
+    is CameraConnectionState.Error -> "ERROR"
+    is CameraConnectionState.Disconnected -> "OFFLINE"
 }
 
-@Composable
-private fun CapturedReview(shot: Bitmap, onDismiss: () -> Unit) {
-    LaunchedEffect(shot) { delay(4000); onDismiss() }
-    Box(
-        Modifier.fillMaxSize().background(Color.Black).clickable(onClick = onDismiss),
-        contentAlignment = Alignment.Center
-    ) {
-        Image(
-            bitmap = shot.asImageBitmap(),
-            contentDescription = "Captured photo",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize().padding(8.dp)
-        )
-        Text(
-            "Captured · tap to dismiss",
-            color = Color.White,
-            fontSize = 12.sp,
-            fontFamily = FontFamily.SansSerif,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 18.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color.White.copy(alpha = 0.14f))
-                .padding(horizontal = 14.dp, vertical = 8.dp)
-        )
-    }
+private fun settingTitle(setting: CameraExposureSetting): String = when (setting) {
+    CameraExposureSetting.APERTURE -> "APERTURE"
+    CameraExposureSetting.SHUTTER_SPEED -> "SHUTTER SPEED"
+    CameraExposureSetting.ISO -> "ISO"
 }

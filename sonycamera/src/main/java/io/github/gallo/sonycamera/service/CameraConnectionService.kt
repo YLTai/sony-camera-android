@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.github.gallo.sonycamera.CameraConnectionState
+import io.github.gallo.sonycamera.CameraExposureSetting
 import io.github.gallo.sonycamera.SonyCamera
 import io.github.gallo.sonycamera.usb.UsbCameraConnectionManager
 import kotlinx.coroutines.CoroutineScope
@@ -113,6 +114,8 @@ class CameraConnectionService : Service() {
         suspend fun takePhoto() = engine.takePhoto()
         suspend fun setAfPoint(x: Int, y: Int) = engine.setAfPoint(x, y)
         suspend fun testAfCenter() = engine.testAfCenter()
+        suspend fun adjustExposure(setting: CameraExposureSetting, direction: Int) =
+            engine.adjustExposure(setting, direction)
         fun isReady() = engine.isReady()
         fun disconnect() = this@CameraConnectionService.handleDisconnect()
     }

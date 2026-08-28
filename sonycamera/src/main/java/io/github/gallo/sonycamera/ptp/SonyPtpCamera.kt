@@ -3,6 +3,10 @@ package io.github.gallo.sonycamera.ptp
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
+import io.github.gallo.sonycamera.CameraExposureOption
+import io.github.gallo.sonycamera.CameraExposureProperty
+import io.github.gallo.sonycamera.CameraExposureSetting
+import io.github.gallo.sonycamera.CameraExposureState
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -793,6 +797,471 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
     /** Backwards-compatible convenience accessor. */
     fun getFocusAreaCode(): Int? = probeFocusArea().focusAreaCode
+
+    // ── Exposure controls ───────────────────────────────────────────────
+
+    private data class ExposureDescriptor(
+        val setting: CameraExposureSetting,
+        val propertyCode: Int,
+        val dataType: Int,
+        val writable: Boolean,
+        val initialValue: Long?,
+        val enumValues: List<Long>,
+        val rangeMin: Long?,
+        val rangeMax: Long?
+    )
+
+    data class ExposureAdjustmentResult(
+        val state: CameraExposureState,
+        val success: Boolean,
+        val message: String? = null
+    )
+
+    private val exposureDescriptors = linkedMapOf<CameraExposureSetting, ExposureDescriptor>()
+    @Volatile private var exposureDescriptorsProbed = false
+
+    /** Probe the property ids once per PTP session, before liveview starts. */
+    @Synchronized
+    private fun ensureExposureDescriptors(force: Boolean = false) {
+        if (exposureDescriptorsProbed && !force) return
+        exposureDescriptors.clear()
+
+        val candidates = linkedMapOf(
+            CameraExposureSetting.APERTURE to intArrayOf(PtpConstants.PROP_PTP_F_NUMBER),
+            CameraExposureSetting.SHUTTER_SPEED to intArrayOf(
+                PtpConstants.PROP_SONY_SHUTTER_SPEED,
+                PtpConstants.PROP_SONY_SHUTTER_SPEED_ALT
+            ),
+            CameraExposureSetting.ISO to intArrayOf(
+                PtpConstants.PROP_SONY_ISO,
+                PtpConstants.PROP_SONY_ISO_ALT
+            )
+        )
+
+        candidates.forEach { (setting, ids) ->
+            probeExposureDescriptor(setting, ids)?.let { descriptor ->
+                exposureDescriptors[setting] = descriptor
+                Log.d(
+                    TAG,
+                    "Exposure ${setting.name}: prop=0x${descriptor.propertyCode.toString(16)} " +
+                        "type=0x${descriptor.dataType.toString(16)} writable=${descriptor.writable} " +
+                        "choices=${descriptor.enumValues.size} current=${descriptor.initialValue}"
+                )
+            }
+        }
+        exposureDescriptorsProbed = true
+    }
+
+    private fun probeExposureDescriptor(
+        setting: CameraExposureSetting,
+        candidates: IntArray
+    ): ExposureDescriptor? {
+        val fallbackType = when (setting) {
+            CameraExposureSetting.APERTURE -> 0x0004 // UINT16
+            CameraExposureSetting.SHUTTER_SPEED,
+            CameraExposureSetting.ISO -> 0x0006 // UINT32
+        }
+
+        for (propertyCode in candidates) {
+            val descResponse = transport.sendCommandWithDataShortTimeout(
+                PtpConstants.OP_SONY_GET_CONTROL_DEVICE_DESC,
+                1200,
+                propertyCode
+            )
+            if (descResponse.isSuccess && descResponse.data.isNotEmpty()) {
+                parseExposureDescriptor(descResponse.data, setting, propertyCode)?.let { return it }
+            }
+
+            // Some bodies return a sparse/empty ControlDeviceDesc but still
+            // support the property value. A successful direct read is enough
+            // to keep the known-safe exposure id as a fallback.
+            val valueResponse = transport.sendCommandWithDataShortTimeout(
+                PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+                900,
+                propertyCode
+            )
+            if (valueResponse.isSuccess && valueResponse.data.isNotEmpty()) {
+                val size = scalarSize(fallbackType)
+                val current = readUnsignedScalar(valueResponse.data, 0, size)
+                return ExposureDescriptor(
+                    setting = setting,
+                    propertyCode = propertyCode,
+                    dataType = fallbackType,
+                    writable = true,
+                    initialValue = current,
+                    enumValues = emptyList(),
+                    rangeMin = null,
+                    rangeMax = null
+                )
+            }
+        }
+        return null
+    }
+
+    private fun parseExposureDescriptor(
+        data: ByteArray,
+        setting: CameraExposureSetting,
+        expectedCode: Int
+    ): ExposureDescriptor? {
+        // 9206 normally starts with code/type/getSet, but scan the first few
+        // bytes as newer Sony generations occasionally prepend small metadata.
+        val starts = (0..minOf(12, data.size - 5)).filter { offset ->
+            u16(data, offset) == expectedCode
+        }
+        if (starts.isEmpty()) return null
+
+        data class Candidate(
+            val descriptor: ExposureDescriptor,
+            val score: Int
+        )
+
+        val parsed = mutableListOf<Candidate>()
+        for (base in starts) {
+            val type = u16(data, base + 2)
+            val size = scalarSize(type)
+            if (size !in 1..4) continue
+            val getSet = data[base + 4].toInt() and 0xFF
+
+            // Standard PTP layout and Sony's extra-flag layout are both seen
+            // in the wild. Pick the one whose form section is structurally valid.
+            for (sonyExtraFlag in listOf(false, true)) {
+                val currentOffset = base + 5 + size + if (sonyExtraFlag) 1 else 0
+                if (currentOffset + size > data.size) continue
+                val current = readUnsignedScalar(data, currentOffset, size)
+                val formOffset = currentOffset + size
+                val formFlag = if (formOffset < data.size) data[formOffset].toInt() and 0xFF else 0
+                if (formFlag !in 0..2) continue
+
+                var enumValues = emptyList<Long>()
+                var rangeMin: Long? = null
+                var rangeMax: Long? = null
+                var structurallyValid = true
+                when (formFlag) {
+                    1 -> {
+                        val start = formOffset + 1
+                        if (start + size * 3 <= data.size) {
+                            rangeMin = readUnsignedScalar(data, start, size)
+                            rangeMax = readUnsignedScalar(data, start + size, size)
+                        } else structurallyValid = false
+                    }
+                    2 -> {
+                        val countOffset = formOffset + 1
+                        if (countOffset + 2 <= data.size) {
+                            val count = u16(data, countOffset)
+                            val valuesOffset = countOffset + 2
+                            if (count in 1..512 && valuesOffset + count * size <= data.size) {
+                                enumValues = List(count) { index ->
+                                    readUnsignedScalar(data, valuesOffset + index * size, size) ?: 0L
+                                }
+                            } else structurallyValid = false
+                        } else structurallyValid = false
+                    }
+                }
+                if (!structurallyValid) continue
+
+                var score = 2
+                if (getSet != 0) score += 2
+                if (enumValues.size > 1) score += 3
+                if (rangeMin != null && rangeMax != null) score += 1
+                if (sonyExtraFlag) score += 1 // 9206/9209 Sony data commonly uses this layout.
+
+                parsed += Candidate(
+                    ExposureDescriptor(
+                        setting = setting,
+                        propertyCode = expectedCode,
+                        dataType = type,
+                        writable = getSet != 0,
+                        initialValue = current,
+                        enumValues = enumValues,
+                        rangeMin = rangeMin,
+                        rangeMax = rangeMax
+                    ),
+                    score
+                )
+            }
+        }
+        return parsed.maxByOrNull { it.score }?.descriptor
+    }
+
+    /** Read aperture, shutter and ISO with one 0x9209 round trip. */
+    fun readExposureState(forceDescriptorProbe: Boolean = false): CameraExposureState {
+        ensureExposureDescriptors(forceDescriptorProbe)
+        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        val allData = if (all.isSuccess) all.data else ByteArray(0)
+
+        fun current(descriptor: ExposureDescriptor?): Long? {
+            descriptor ?: return null
+            val fromAll = if (allData.isNotEmpty()) {
+                readCurrentFromAllProperties(allData, descriptor)
+            } else null
+            if (fromAll != null) return fromAll
+
+            val direct = transport.sendCommandWithData(
+                PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+                descriptor.propertyCode
+            )
+            if (!direct.isSuccess || direct.data.isEmpty()) return descriptor.initialValue
+            return readUnsignedScalar(direct.data, 0, scalarSize(descriptor.dataType))
+                ?: descriptor.initialValue
+        }
+
+        val apertureDesc = exposureDescriptors[CameraExposureSetting.APERTURE]
+        val shutterDesc = exposureDescriptors[CameraExposureSetting.SHUTTER_SPEED]
+        val isoDesc = exposureDescriptors[CameraExposureSetting.ISO]
+
+        return CameraExposureState(
+            aperture = buildExposureProperty(apertureDesc, current(apertureDesc)),
+            shutterSpeed = buildExposureProperty(shutterDesc, current(shutterDesc)),
+            iso = buildExposureProperty(isoDesc, current(isoDesc))
+        )
+    }
+
+    /** Step one setting by one camera-supported value and verify the write. */
+    fun adjustExposure(
+        setting: CameraExposureSetting,
+        direction: Int
+    ): ExposureAdjustmentResult {
+        val before = readExposureState()
+        val property = before.property(setting)
+        val descriptor = exposureDescriptors[setting]
+        if (descriptor == null || !property.writable || property.current == null) {
+            return ExposureAdjustmentResult(before, false, "${settingLabel(setting)} is not adjustable in this camera mode")
+        }
+        if (property.options.size < 2) {
+            return ExposureAdjustmentResult(before, false, "No selectable ${settingLabel(setting)} steps reported by camera")
+        }
+
+        val currentRaw = property.current.rawValue
+        var index = property.options.indexOfFirst { it.rawValue == currentRaw }
+        if (index < 0) index = 0
+        val targetIndex = (index + direction.coerceIn(-1, 1)).coerceIn(0, property.options.lastIndex)
+        if (targetIndex == index) return ExposureAdjustmentResult(before, true)
+
+        val target = property.options[targetIndex]
+        val response = setExposureRaw(descriptor, target.rawValue)
+        Thread.sleep(160)
+        var after = readExposureState()
+        if (after.property(setting).current?.rawValue != target.rawValue) {
+            // Sony can acknowledge configuration writes before the property
+            // snapshot changes. Give it one short second chance.
+            Thread.sleep(220)
+            after = readExposureState()
+        }
+
+        val applied = after.property(setting).current?.rawValue == target.rawValue
+        if (applied) return ExposureAdjustmentResult(after, true)
+
+        val reason = if (response.isSuccess) {
+            "Camera did not apply ${target.label}"
+        } else {
+            "Camera rejected ${settingLabel(setting)} change (${PtpConstants.responseCodeName(response.responseCode)})"
+        }
+        return ExposureAdjustmentResult(after, false, reason)
+    }
+
+    private fun setExposureRaw(descriptor: ExposureDescriptor, value: Long): PtpResponse {
+        val size = scalarSize(descriptor.dataType)
+        val data = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            when (size) {
+                1 -> put((value and 0xFF).toByte())
+                2 -> putShort((value and 0xFFFF).toShort())
+                4 -> putInt((value and 0xFFFFFFFFL).toInt())
+            }
+        }.array()
+
+        val sony = transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
+            data,
+            descriptor.propertyCode
+        )
+        if (sony.isSuccess) return sony
+
+        // FNumber is a standard PTP property as well. A few bodies expose it
+        // through 9206 but expect the standard SetDevicePropValue write path.
+        if (descriptor.propertyCode == PtpConstants.PROP_PTP_F_NUMBER) {
+            return transport.sendCommandWithDataOut(
+                PtpConstants.OP_SET_DEVICE_PROP_VALUE,
+                data,
+                descriptor.propertyCode
+            )
+        }
+        return sony
+    }
+
+    private fun buildExposureProperty(
+        descriptor: ExposureDescriptor?,
+        currentRaw: Long?
+    ): CameraExposureProperty {
+        if (descriptor == null) {
+            return CameraExposureProperty(current = null, options = emptyList(), writable = false)
+        }
+
+        val raws = buildRawChoices(descriptor, currentRaw)
+        val options = raws.map { raw ->
+            CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
+        }
+        val current = currentRaw?.let { raw ->
+            options.firstOrNull { it.rawValue == raw }
+                ?: CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
+        }
+        return CameraExposureProperty(
+            current = current,
+            options = options,
+            writable = descriptor.writable && options.size > 1
+        )
+    }
+
+    private fun buildRawChoices(
+        descriptor: ExposureDescriptor,
+        currentRaw: Long?
+    ): List<Long> {
+        var values = descriptor.enumValues.distinct()
+        if (descriptor.setting == CameraExposureSetting.ISO && values.isNotEmpty()) {
+            values = values.filter { isUsefulIsoValue(it) }
+        }
+        if (values.size < 2) {
+            values = canonicalValues(descriptor.setting).filter { value ->
+                val aboveMin = descriptor.rangeMin?.let { value >= it } ?: true
+                val belowMax = descriptor.rangeMax?.let { value <= it } ?: true
+                aboveMin && belowMax
+            }
+        }
+
+        val mutable = values.toMutableList()
+        if (currentRaw != null && currentRaw !in mutable) mutable += currentRaw
+        return when (descriptor.setting) {
+            CameraExposureSetting.APERTURE -> mutable.distinct().sorted()
+            CameraExposureSetting.ISO -> mutable.distinct().sortedWith(compareBy { isoSortKey(it) })
+            CameraExposureSetting.SHUTTER_SPEED -> mutable.distinct().sortedByDescending { shutterSeconds(it) }
+        }
+    }
+
+    private fun canonicalValues(setting: CameraExposureSetting): List<Long> = when (setting) {
+        CameraExposureSetting.APERTURE -> listOf(
+            100, 110, 120, 140, 160, 180, 200, 220, 250, 280, 320, 350,
+            400, 450, 500, 560, 630, 710, 800, 900, 1000, 1100, 1300, 1400,
+            1600, 1800, 2000, 2200, 2500, 2900, 3200, 3600, 4000, 4500,
+            5100, 5700, 6400
+        ).map(Int::toLong)
+
+        CameraExposureSetting.ISO -> listOf(
+            0x00FFFFFFL,
+            50L, 64L, 80L, 100L, 125L, 160L, 200L, 250L, 320L, 400L, 500L,
+            640L, 800L, 1000L, 1250L, 1600L, 2000L, 2500L, 3200L, 4000L,
+            5000L, 6400L, 8000L, 10000L, 12800L, 16000L, 20000L, 25600L,
+            32000L, 40000L, 51200L, 64000L, 80000L, 102400L, 128000L,
+            160000L, 204800L, 256000L, 320000L, 409600L
+        )
+
+        CameraExposureSetting.SHUTTER_SPEED -> buildList {
+            listOf(30, 25, 20, 15, 13, 10, 8, 6, 5, 4, 3, 2).forEach { add(packShutter(it, 1)) }
+            add(packShutter(1, 1))
+            listOf(
+                2, 3, 4, 5, 6, 8, 10, 13, 15, 20, 25, 30, 40, 50, 60, 80,
+                100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250,
+                1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000
+            ).forEach { denominator -> add(packShutter(1, denominator)) }
+        }
+    }
+
+    private fun packShutter(numerator: Int, denominator: Int): Long =
+        ((numerator.toLong() and 0xFFFF) shl 16) or (denominator.toLong() and 0xFFFF)
+
+    private fun shutterSeconds(raw: Long): Double {
+        val numerator = (raw ushr 16) and 0xFFFF
+        val denominator = raw and 0xFFFF
+        if (numerator == 0L || denominator == 0L) return Double.POSITIVE_INFINITY
+        return numerator.toDouble() / denominator.toDouble()
+    }
+
+    private fun formatExposureValue(setting: CameraExposureSetting, raw: Long): String = when (setting) {
+        CameraExposureSetting.APERTURE -> {
+            if (raw <= 0L) "--"
+            else {
+                val value = raw.toDouble() / 100.0
+                val text = if (raw % 100L == 0L) value.toInt().toString() else "%.1f".format(value)
+                "F$text"
+            }
+        }
+        CameraExposureSetting.ISO -> {
+            when {
+                raw == 0x00FFFFFFL -> "AUTO"
+                raw in 25L..409600L -> raw.toString()
+                (raw and 0x00FFFFFFL) in 25L..409600L -> (raw and 0x00FFFFFFL).toString()
+                else -> "--"
+            }
+        }
+        CameraExposureSetting.SHUTTER_SPEED -> {
+            val numerator = (raw ushr 16) and 0xFFFF
+            val denominator = raw and 0xFFFF
+            when {
+                raw == 0L -> "BULB"
+                numerator == 0L || denominator == 0L -> "--"
+                numerator >= denominator -> {
+                    val seconds = numerator.toDouble() / denominator.toDouble()
+                    if (kotlin.math.abs(seconds - seconds.toInt()) < 0.05) "${seconds.toInt()}\""
+                    else "%.1f\"".format(seconds)
+                }
+                numerator == 1L -> "1/$denominator"
+                else -> "$numerator/$denominator"
+            }
+        }
+    }
+
+    private fun isUsefulIsoValue(raw: Long): Boolean =
+        raw == 0x00FFFFFFL || raw in 25L..409600L
+
+    private fun isoSortKey(raw: Long): Long = if (raw == 0x00FFFFFFL) Long.MIN_VALUE else raw
+
+    private fun settingLabel(setting: CameraExposureSetting): String = when (setting) {
+        CameraExposureSetting.APERTURE -> "aperture"
+        CameraExposureSetting.SHUTTER_SPEED -> "shutter speed"
+        CameraExposureSetting.ISO -> "ISO"
+    }
+
+    private fun readCurrentFromAllProperties(
+        data: ByteArray,
+        descriptor: ExposureDescriptor
+    ): Long? {
+        val size = scalarSize(descriptor.dataType)
+        if (size !in 1..4) return null
+        for (i in 8 until data.size - 5) {
+            if (u16(data, i) != descriptor.propertyCode) continue
+            if (u16(data, i + 2) != descriptor.dataType) continue
+
+            // Sony's GetAllDevicePropData adds one flag byte between default
+            // and current. This is the layout already used for D215 in this app.
+            val sonyCurrentOffset = i + 6 + size
+            readUnsignedScalar(data, sonyCurrentOffset, size)?.let { return it }
+
+            // Defensive fallback for bodies that use standard PTP layout.
+            val standardCurrentOffset = i + 5 + size
+            readUnsignedScalar(data, standardCurrentOffset, size)?.let { return it }
+        }
+        return null
+    }
+
+    private fun scalarSize(dataType: Int): Int = when (dataType) {
+        0x0001, 0x0002 -> 1
+        0x0003, 0x0004 -> 2
+        0x0005, 0x0006 -> 4
+        else -> 0
+    }
+
+    private fun readUnsignedScalar(data: ByteArray, offset: Int, size: Int): Long? {
+        if (offset < 0 || size !in listOf(1, 2, 4) || offset + size > data.size) return null
+        return when (size) {
+            1 -> (data[offset].toInt() and 0xFF).toLong()
+            2 -> (ByteBuffer.wrap(data, offset, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF).toLong()
+            4 -> ByteBuffer.wrap(data, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
+            else -> null
+        }
+    }
+
+    private fun u16(data: ByteArray, offset: Int): Int {
+        if (offset < 0 || offset + 2 > data.size) return -1
+        return (data[offset].toInt() and 0xFF) or ((data[offset + 1].toInt() and 0xFF) shl 8)
+    }
 
     // ── Sony Photo Transfer Queue ──
 

@@ -73,9 +73,12 @@ object PtpConstants {
     const val PROP_SONY_AF_STATUS = 0xD2C7
     const val PROP_SONY_PHOTO_CAPTURE = 0xD2C8
     const val PROP_SONY_EXPOSURE_MODE = 0xD210
-    const val PROP_SONY_ISO = 0xD21E
-    const val PROP_SONY_SHUTTER_SPEED = 0xD21D
-    const val PROP_SONY_F_NUMBER = 0xD218
+    const val PROP_PTP_F_NUMBER = 0x5007             // Standard PTP FNumber (UINT16, value ×100)
+    const val PROP_SONY_ISO = 0xD21E                 // Modern Sony ISO (UINT32)
+    const val PROP_SONY_ISO_ALT = 0xD226             // Alternate ISO id on some newer Sony bodies
+    const val PROP_SONY_SHUTTER_SPEED = 0xD20D       // Sony packed rational shutter speed (UINT32)
+    const val PROP_SONY_SHUTTER_SPEED_ALT = 0xD229   // Alternate shutter id on some Sony generations
+    const val PROP_SONY_F_NUMBER = 0xD218            // Legacy id; not used for modern exposure control
     const val PROP_SONY_FOCUS_MODE = 0xD208
     const val PROP_SONY_FOCUS_AREA = 0xD22C // Sony Focus Area
     const val PROP_SONY_AF_AREA_POSITION = 0xD2DC // AF Area Position (u32 on newer bodies)

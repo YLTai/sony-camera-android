@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 import io.github.gallo.sonycamera.CameraConnectionManager
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraExposureSetting
 import io.github.gallo.sonycamera.CameraOperationResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -175,6 +176,13 @@ class CameraConnectionClient(
 
     override suspend fun testAfCenter(): CameraOperationResult =
         binderFlow.value?.testAfCenter()
+            ?: CameraOperationResult.Failure("Camera not connected")
+
+    override suspend fun adjustExposure(
+        setting: CameraExposureSetting,
+        direction: Int
+    ): CameraOperationResult =
+        binderFlow.value?.adjustExposure(setting, direction)
             ?: CameraOperationResult.Failure("Camera not connected")
 
     override fun isReady(): Boolean = binderFlow.value?.isReady() == true
