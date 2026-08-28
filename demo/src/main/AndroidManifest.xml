@@ -1,10 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The camera service, USB-host feature, and foreground-service
-         permissions are contributed by the :sonycamera library manifest and
-         merged in automatically — they don't need to be repeated here. -->
-
     <application
         android:name=".DemoApp"
         android:allowBackup="true"
@@ -16,8 +12,10 @@
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape"
             android:theme="@style/Theme.SonyCameraDemo">
 
             <intent-filter>
@@ -25,8 +23,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Offer to launch the app when a Sony PTP camera is attached.
-                 The device filter ships inside the library. -->
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>

@@ -33,6 +33,9 @@ sealed class CameraEvent {
     /** Diagnostic information from the Sony focus-area probe. */
     data class FocusDebug(val message: String) : CameraEvent()
 
+    /** Last AF target accepted by the app-side Sony control path. */
+    data class AfTargetUpdated(val x: Int, val y: Int) : CameraEvent()
+
     /**
      * The shutter is firing now — the capture sequence has just begun.
      * Emitted so the UI flash/sound coincide with the real capture instead
@@ -75,6 +78,9 @@ interface CameraConnectionManager {
 
     /** Take a photo and return the captured bitmap. */
     suspend fun takePhoto(): CameraOperationResult
+
+    /** Move the Sony AF target on its 640x480 logical focus grid. */
+    suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult
 
     /** Diagnostic: write Sony AF Area Position to the protocol center (320, 240). */
     suspend fun testAfCenter(): CameraOperationResult

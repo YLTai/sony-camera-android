@@ -401,19 +401,24 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
-     * Diagnostic for A7C II: move the Sony logical AF position to the center,
-     * then briefly half-press AF. The camera must be in an AF-capable focus
-     * mode and normally a Spot/Flexible-Spot style focus area for D2DC to have
-     * a visible effect.
+     * Move the Sony logical AF target and immediately trigger a short AF
+     * half-press. A7C II uses a 640x480 logical grid for D2DC.
      */
-    fun testAfCenter(): String {
-        val setResult = setAfAreaPosition(320, 240)
+    fun setAfPoint(x: Int, y: Int): String = commandAfPoint("AF TARGET", x, y)
+
+    /** Diagnostic convenience entry point retained by the demo. */
+    fun testAfCenter(): String = commandAfPoint("AF CENTER TEST", 320, 240)
+
+    private fun commandAfPoint(label: String, x: Int, y: Int): String {
+        val safeX = x.coerceIn(0, 639)
+        val safeY = y.coerceIn(0, 479)
+        val setResult = setAfAreaPosition(safeX, safeY)
         Thread.sleep(120)
         val pressResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 2)
         Thread.sleep(450)
         val releaseResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 1)
         return buildString {
-            append("AF CENTER TEST x=320 y=240")
+            append(label).append(" x=").append(safeX).append(" y=").append(safeY)
             append(" | D2DC/9207=")
             append(PtpConstants.responseCodeName(setResult.responseCode))
             append(" | halfPress=")

@@ -410,12 +410,31 @@ class UsbCameraConnectionManager(
         return CameraOperationResult.Success
     }
 
+    override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult = withContext(Dispatchers.IO) {
+        val camera = ptpCamera
+            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
+        val safeX = x.coerceIn(0, 639)
+        val safeY = y.coerceIn(0, 479)
+        try {
+            val message = camera.setAfPoint(safeX, safeY)
+            _events.emit(CameraEvent.FocusDebug(message))
+            _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+            CameraOperationResult.SuccessWithData(message)
+        } catch (e: Exception) {
+            Log.e(TAG, "AF target command failed", e)
+            val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
+            _events.emit(CameraEvent.FocusDebug(message))
+            CameraOperationResult.Failure(message)
+        }
+    }
+
     override suspend fun testAfCenter(): CameraOperationResult = withContext(Dispatchers.IO) {
         val camera = ptpCamera
             ?: return@withContext CameraOperationResult.Failure("Camera not connected")
         try {
             val message = camera.testAfCenter()
             _events.emit(CameraEvent.FocusDebug(message))
+            _events.emit(CameraEvent.AfTargetUpdated(320, 240))
             CameraOperationResult.SuccessWithData(message)
         } catch (e: Exception) {
             Log.e(TAG, "AF center test failed", e)

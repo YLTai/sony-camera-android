@@ -169,6 +169,10 @@ class CameraConnectionClient(
         binderFlow.value?.takePhoto()
             ?: CameraOperationResult.Failure("Camera not connected")
 
+    override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult =
+        binderFlow.value?.setAfPoint(x, y)
+            ?: CameraOperationResult.Failure("Camera not connected")
+
     override suspend fun testAfCenter(): CameraOperationResult =
         binderFlow.value?.testAfCenter()
             ?: CameraOperationResult.Failure("Camera not connected")
