@@ -22,6 +22,7 @@ import io.github.gallo.sonycamera.CameraExposureSetting
 import io.github.gallo.sonycamera.CameraFocusFrame
 import io.github.gallo.sonycamera.CameraFocusFrameInfo
 import io.github.gallo.sonycamera.CameraOperationResult
+import io.github.gallo.sonycamera.CameraSetting
 import io.github.gallo.sonycamera.ptp.PtpConstants
 import io.github.gallo.sonycamera.ptp.PtpTransport
 import io.github.gallo.sonycamera.ptp.SonyPtpCamera
@@ -67,6 +68,7 @@ class UsbCameraConnectionManager(
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
         private const val EXPOSURE_POLL_INTERVAL_MS = 1_200L
+        private const val SETTINGS_POLL_INTERVAL_MS = 2_200L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -293,6 +295,7 @@ class UsbCameraConnectionManager(
             var errorCount = 0L
             var lastLogTime = System.currentTimeMillis()
             var lastExposurePollTime = 0L
+            var lastSettingsPollTime = 0L
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
             var pipeRecoveryAttempts = 0
@@ -367,6 +370,13 @@ class UsbCameraConnectionManager(
                             lastExposurePollTime = exposurePollNow
                             ptpCamera?.readExposureState()?.let { exposure ->
                                 _events.emit(CameraEvent.ExposureUpdated(exposure))
+                            }
+                        }
+
+                        if (exposurePollNow - lastSettingsPollTime >= SETTINGS_POLL_INTERVAL_MS) {
+                            lastSettingsPollTime = exposurePollNow
+                            ptpCamera?.readCameraSettingsState()?.let { settings ->
+                                _events.emit(CameraEvent.CameraSettingsUpdated(settings))
                             }
                         }
 
@@ -485,6 +495,30 @@ class UsbCameraConnectionManager(
         _events.emit(CameraEvent.ExposureUpdated(result.state))
         if (result.success) CameraOperationResult.Success
         else CameraOperationResult.Failure(result.message ?: "Exposure change failed")
+    }
+
+    override suspend fun setExposure(
+        setting: CameraExposureSetting,
+        rawValue: Long
+    ): CameraOperationResult = withContext(Dispatchers.IO) {
+        val camera = ptpCamera
+            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
+        val result = camera.setExposureValue(setting, rawValue)
+        _events.emit(CameraEvent.ExposureUpdated(result.state))
+        if (result.success) CameraOperationResult.Success
+        else CameraOperationResult.Failure(result.message ?: "Exposure change failed")
+    }
+
+    override suspend fun setCameraSetting(
+        setting: CameraSetting,
+        rawValue: Long
+    ): CameraOperationResult = withContext(Dispatchers.IO) {
+        val camera = ptpCamera
+            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
+        val result = camera.setCameraSettingValue(setting, rawValue)
+        _events.emit(CameraEvent.CameraSettingsUpdated(result.state))
+        if (result.success) CameraOperationResult.Success
+        else CameraOperationResult.Failure(result.message ?: "Camera setting change failed")
     }
 
     override suspend fun takePhoto(): CameraOperationResult = try {

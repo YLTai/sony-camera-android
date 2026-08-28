@@ -14,6 +14,7 @@ import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
 import io.github.gallo.sonycamera.CameraExposureSetting
 import io.github.gallo.sonycamera.CameraOperationResult
+import io.github.gallo.sonycamera.CameraSetting
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -183,6 +184,20 @@ class CameraConnectionClient(
         direction: Int
     ): CameraOperationResult =
         binderFlow.value?.adjustExposure(setting, direction)
+            ?: CameraOperationResult.Failure("Camera not connected")
+
+    override suspend fun setExposure(
+        setting: CameraExposureSetting,
+        rawValue: Long
+    ): CameraOperationResult =
+        binderFlow.value?.setExposure(setting, rawValue)
+            ?: CameraOperationResult.Failure("Camera not connected")
+
+    override suspend fun setCameraSetting(
+        setting: CameraSetting,
+        rawValue: Long
+    ): CameraOperationResult =
+        binderFlow.value?.setCameraSetting(setting, rawValue)
             ?: CameraOperationResult.Failure("Camera not connected")
 
     override fun isReady(): Boolean = binderFlow.value?.isReady() == true
