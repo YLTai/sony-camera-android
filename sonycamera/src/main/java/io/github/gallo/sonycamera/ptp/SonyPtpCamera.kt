@@ -513,43 +513,125 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      * this library. PTP2 does not expose an arbitrary live AF-frame XY
      * coordinate, so callers must not invent one for Zone/Flexible Spot.
      */
-    fun getFocusAreaCode(): Int? {
-        val response = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
-        if (!response.isSuccess || response.data.size < 20) return null
+    data class FocusAreaProbe(
+        val focusAreaCode: Int?,
+        val debug: String
+    )
 
-        val data = response.data
-        for (offset in 8 until data.size - 10) {
+    /**
+     * Probe Sony Focus Area (0xD22C) with diagnostics.
+     *
+     * First try Sony GetDevicePropertyValue (0x9204), which avoids depending
+     * on the generation-specific layout of the 0x9209 aggregate property blob.
+     * Older bodies/firmware may reject 0x9204 for this property, so we then
+     * scan 0x9209 and test both standard PTP and Sony's extra-flag layout.
+     */
+    fun probeFocusArea(): FocusAreaProbe {
+        val knownValues = setOf(
+            0x0001, 0x0002, 0x0003,
+            0x0101, 0x0102, 0x0103, 0x0104,
+            0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206, 0x0207
+        )
+
+        // Fast/direct path. sendCommandWithData strips the PTP container, so
+        // response.data is the property payload itself.
+        val direct = transport.sendCommandWithData(
+            PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+            PtpConstants.PROP_SONY_FOCUS_AREA
+        )
+        val directValue = when {
+            direct.data.size >= 2 -> ByteBuffer.wrap(direct.data, 0, 2)
+                .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+            direct.data.size == 1 -> direct.data[0].toInt() and 0xFF
+            else -> null
+        }
+        val directSummary = "9204=${PtpConstants.responseCodeName(direct.responseCode)} " +
+            "${direct.dataSize}B value=${directValue?.let { "0x%04X".format(it) } ?: "n/a"}"
+
+        if (direct.isSuccess && directValue in knownValues) {
+            return FocusAreaProbe(directValue, directSummary).also {
+                Log.d(TAG, "AF probe: ${it.debug}")
+            }
+        }
+
+        // Fallback for Sony generation-2 bodies: inspect the aggregate blob.
+        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        if (!all.isSuccess || all.data.size < 8) {
+            val result = FocusAreaProbe(
+                null,
+                "$directSummary; 9209=${PtpConstants.responseCodeName(all.responseCode)} ${all.dataSize}B"
+            )
+            Log.d(TAG, "AF probe: ${result.debug}")
+            return result
+        }
+
+        val data = all.data
+        val hits = mutableListOf<String>()
+        var selected: Int? = null
+
+        fun readValue(offset: Int, size: Int): Int? {
+            if (offset < 0 || offset + size > data.size) return null
+            return when (size) {
+                1 -> data[offset].toInt() and 0xFF
+                2 -> ByteBuffer.wrap(data, offset, 2)
+                    .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                4 -> ByteBuffer.wrap(data, offset, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN).int
+                else -> null
+            }
+        }
+
+        for (offset in 0 until data.size - 4) {
             val code = (data[offset].toInt() and 0xFF) or
                 ((data[offset + 1].toInt() and 0xFF) shl 8)
             if (code != PtpConstants.PROP_SONY_FOCUS_AREA) continue
 
             val dataType = (data[offset + 2].toInt() and 0xFF) or
                 ((data[offset + 3].toInt() and 0xFF) shl 8)
-            if (dataType !in 1..8) continue
-
             val valueSize = when (dataType) {
                 1, 2 -> 1
-                3, 4 -> 2 // UINT16/INT16 on ILCE-6600
+                3, 4 -> 2
                 5, 6 -> 4
-                else -> continue
+                else -> 0
             }
 
-            // Sony adds one flag byte between default and current values.
-            val currentOffset = offset + 6 + valueSize
-            if (currentOffset + valueSize > data.size) continue
+            val standard = if (valueSize > 0) readValue(offset + 5 + valueSize, valueSize) else null
+            val sonyFlagged = if (valueSize > 0) readValue(offset + 6 + valueSize, valueSize) else null
 
-            return when (valueSize) {
-                1 -> data[currentOffset].toInt() and 0xFF
-                2 -> ByteBuffer.wrap(data, currentOffset, 2)
-                    .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                4 -> ByteBuffer.wrap(data, currentOffset, 4)
-                    .order(ByteOrder.LITTLE_ENDIAN).int
-                else -> null
+            if (selected == null) {
+                selected = when {
+                    standard in knownValues -> standard
+                    sonyFlagged in knownValues -> sonyFlagged
+                    else -> null
+                }
             }
+
+            val from = (offset - 2).coerceAtLeast(0)
+            val to = (offset + 16).coerceAtMost(data.size)
+            val bytes = data.copyOfRange(from, to)
+                .joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+            hits += "D22C@$offset type=0x%04X std=%s sony=%s bytes=%s".format(
+                dataType,
+                standard?.let { "0x%04X".format(it) } ?: "n/a",
+                sonyFlagged?.let { "0x%04X".format(it) } ?: "n/a",
+                bytes
+            )
+            if (hits.size >= 2) break
         }
 
-        return null
+        val debug = buildString {
+            append(directSummary)
+            append("; 9209=OK ${all.dataSize}B")
+            if (hits.isEmpty()) append("; D22C NOT FOUND")
+            else append("; ").append(hits.joinToString(" | "))
+        }
+        val result = FocusAreaProbe(selected, debug)
+        Log.d(TAG, "AF probe: ${result.debug}")
+        return result
     }
+
+    /** Backwards-compatible convenience accessor. */
+    fun getFocusAreaCode(): Int? = probeFocusArea().focusAreaCode
 
     // ── Sony Photo Transfer Queue ──
 

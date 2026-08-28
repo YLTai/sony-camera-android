@@ -30,6 +30,9 @@ sealed class CameraEvent {
      */
     data class FocusAreaUpdated(val rawValue: Int) : CameraEvent()
 
+    /** Diagnostic information from the Sony focus-area probe. */
+    data class FocusDebug(val message: String) : CameraEvent()
+
     /**
      * The shutter is firing now — the capture sequence has just begun.
      * Emitted so the UI flash/sound coincide with the real capture instead

@@ -332,7 +332,10 @@ class UsbCameraConnectionManager(
                         val focusPollNow = System.currentTimeMillis()
                         if (focusPollNow - lastFocusAreaPollTime >= FOCUS_AREA_POLL_INTERVAL_MS) {
                             lastFocusAreaPollTime = focusPollNow
-                            ptpCamera?.getFocusAreaCode()?.let { _events.emit(CameraEvent.FocusAreaUpdated(it)) }
+                            ptpCamera?.probeFocusArea()?.let { probe ->
+                                _events.emit(CameraEvent.FocusDebug(probe.debug))
+                                probe.focusAreaCode?.let { _events.emit(CameraEvent.FocusAreaUpdated(it)) }
+                            }
                         }
 
                         // Pace: ensure minimum interval between successful frames

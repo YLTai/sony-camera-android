@@ -76,10 +76,16 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var flash by remember { mutableStateOf(false) }
             var lastError by remember { mutableStateOf<String?>(null) }
             var focusAreaCode by remember { mutableStateOf<Int?>(null) }
+            var focusDebug by remember { mutableStateOf("waiting for first AF probe…") }
+            var focusEventCount by remember { mutableStateOf(0) }
+            var liveFrameCount by remember { mutableStateOf(0L) }
 
             // Live-view frames stream in as Bitmaps.
             LaunchedEffect(camera) {
-                camera.liveviewFrames.collect { frame = it }
+                camera.liveviewFrames.collect { bitmap ->
+                    frame = bitmap
+                    liveFrameCount++
+                }
             }
             // One-shot events: capture, shutter flash, transient errors.
             LaunchedEffect(camera) {
@@ -87,7 +93,11 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     when (event) {
                         is CameraEvent.PhotoCaptured -> captured = event.bitmap
                         is CameraEvent.ShutterFired -> flash = true
-                        is CameraEvent.FocusAreaUpdated -> focusAreaCode = event.rawValue
+                        is CameraEvent.FocusAreaUpdated -> {
+                            focusAreaCode = event.rawValue
+                            focusEventCount++
+                        }
+                        is CameraEvent.FocusDebug -> focusDebug = event.message
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
                     }
@@ -130,6 +140,23 @@ fun CameraScreen(camera: CameraConnectionClient) {
                             .align(Alignment.TopStart)
                             .systemBarsPadding()
                             .padding(start = 16.dp, top = 16.dp)
+                    )
+                }
+
+                // Always-visible diagnostic panel while connected. This is
+                // intentionally shown even when D22C cannot be parsed.
+                if (state is CameraConnectionState.Ready) {
+                    FocusDebugPanel(
+                        frame = f,
+                        liveFrameCount = liveFrameCount,
+                        focusAreaCode = focusAreaCode,
+                        focusEventCount = focusEventCount,
+                        debug = focusDebug,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .systemBarsPadding()
+                            .fillMaxWidth()
+                            .padding(start = 12.dp, end = 12.dp, top = 66.dp)
                     )
                 }
 
@@ -198,6 +225,47 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FocusDebugPanel(
+    frame: Bitmap?,
+    liveFrameCount: Long,
+    focusAreaCode: Int?,
+    focusEventCount: Int,
+    debug: String,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.Black.copy(alpha = 0.72f))
+            .padding(horizontal = 10.dp, vertical = 7.dp)
+    ) {
+        Text(
+            "AF DEBUG",
+            color = Color(0xFFFFD166),
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            "frames=$liveFrameCount  size=${frame?.width ?: 0}x${frame?.height ?: 0}  " +
+                "areaEvents=$focusEventCount",
+            color = Color.White,
+            fontSize = 9.sp
+        )
+        Text(
+            "area=${focusAreaCode?.let { focusAreaLabel(it) + " / 0x%04X".format(it) } ?: "NONE"}",
+            color = if (focusAreaCode == null) Color(0xFFFFC857) else Color(0xFF36D399),
+            fontSize = 9.sp
+        )
+        Text(
+            debug,
+            color = Color.White.copy(alpha = 0.78f),
+            fontSize = 8.sp,
+            maxLines = 4
+        )
     }
 }
 
