@@ -63,6 +63,7 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
+        private const val FOCUS_AREA_POLL_INTERVAL_MS = 1_000L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -286,6 +287,7 @@ class UsbCameraConnectionManager(
             var frameCount = 0L
             var errorCount = 0L
             var lastLogTime = System.currentTimeMillis()
+            var lastFocusAreaPollTime = 0L
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
             var pipeRecoveryAttempts = 0
@@ -323,6 +325,15 @@ class UsbCameraConnectionManager(
                         hasEverGottenFrame = true
                         pipeRecoveryAttempts = 0
                         lastFrameTime = System.currentTimeMillis()
+
+                        // Focus-area state changes far less often than liveview frames. Poll
+                        // once per second to keep the extra 0x9209 round trip inexpensive.
+                        // Emit every successful read so recreated UI collectors recover state.
+                        val focusPollNow = System.currentTimeMillis()
+                        if (focusPollNow - lastFocusAreaPollTime >= FOCUS_AREA_POLL_INTERVAL_MS) {
+                            lastFocusAreaPollTime = focusPollNow
+                            ptpCamera?.getFocusAreaCode()?.let { _events.emit(CameraEvent.FocusAreaUpdated(it)) }
+                        }
 
                         // Pace: ensure minimum interval between successful frames
                         val elapsed = System.currentTimeMillis() - frameStart

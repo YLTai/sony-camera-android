@@ -23,6 +23,12 @@ sealed class CameraEvent {
     data class PhotoCaptured(val bitmap: Bitmap) : CameraEvent()
     data class Error(val message: String) : CameraEvent()
     data object ConnectionLost : CameraEvent()
+    
+    /**
+     * Current Sony focus-area mode reported by device property 0xD22C.
+     * The raw value preserves forward compatibility with newer bodies.
+     */
+    data class FocusAreaUpdated(val rawValue: Int) : CameraEvent()
 
     /**
      * The shutter is firing now — the capture sequence has just begun.

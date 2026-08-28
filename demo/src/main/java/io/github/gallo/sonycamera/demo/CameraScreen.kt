@@ -8,6 +8,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -74,6 +75,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var captured by remember { mutableStateOf<Bitmap?>(null) }
             var flash by remember { mutableStateOf(false) }
             var lastError by remember { mutableStateOf<String?>(null) }
+            var focusAreaCode by remember { mutableStateOf<Int?>(null) }
 
             // Live-view frames stream in as Bitmaps.
             LaunchedEffect(camera) {
@@ -85,11 +87,17 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     when (event) {
                         is CameraEvent.PhotoCaptured -> captured = event.bitmap
                         is CameraEvent.ShutterFired -> flash = true
+                        is CameraEvent.FocusAreaUpdated -> focusAreaCode = event.rawValue
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
                     }
                 }
             }
+            // Never keep stale AF state visible after a disconnect/reconnect transition.
+            LaunchedEffect(state) {
+                if (state !is CameraConnectionState.Ready) focusAreaCode = null
+            }
+
             // Auto-clear the white flash overlay.
             LaunchedEffect(flash) {
                 if (flash) { delay(60); flash = false }
@@ -107,6 +115,22 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     )
                 } else {
                     PreviewPlaceholder(state)
+                }
+
+                // ILCE-6600/PTP2 exposes the focus-area MODE via 0xD22C, but not
+                // an arbitrary live AF-frame XY coordinate. Center is deterministic.
+                focusAreaCode?.let { code ->
+                    if (code == 0x0003 && f != null) {
+                        FocusPointOverlay(modifier = Modifier.align(Alignment.Center))
+                    }
+
+                    FocusAreaPill(
+                        code = code,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .systemBarsPadding()
+                            .padding(start = 16.dp, top = 16.dp)
+                    )
                 }
 
                 // ── Shutter flash ─────────────────────────────────────────────
@@ -175,6 +199,64 @@ fun CameraScreen(camera: CameraConnectionClient) {
             }
         }
     }
+}
+
+@Composable
+private fun FocusPointOverlay(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(width = 72.dp, height = 52.dp)
+            .border(2.dp, Accent, RoundedCornerShape(6.dp))
+    ) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(5.dp)
+                .background(Accent, CircleShape)
+        )
+    }
+}
+
+@Composable
+private fun FocusAreaPill(code: Int, modifier: Modifier = Modifier) {
+    val isCenter = code == 0x0003
+
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.Black.copy(alpha = 0.62f))
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Text(
+            text = "AF area: ${focusAreaLabel(code)}",
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Text(
+            text = if (isCenter) "AF point: center" else "AF point: unavailable over PTP2",
+            color = Color.White.copy(alpha = 0.72f),
+            fontSize = 10.sp
+        )
+    }
+}
+
+private fun focusAreaLabel(code: Int): String = when (code) {
+    0x0001 -> "Wide"
+    0x0002 -> "Zone"
+    0x0003 -> "Center"
+    0x0101 -> "Flexible Spot S"
+    0x0102 -> "Flexible Spot M"
+    0x0103 -> "Flexible Spot L"
+    0x0104 -> "Expand Flexible Spot"
+    0x0201 -> "Lock-on: Wide"
+    0x0202 -> "Lock-on: Zone"
+    0x0203 -> "Lock-on: Center"
+    0x0204 -> "Lock-on: Flexible Spot S"
+    0x0205 -> "Lock-on: Flexible Spot M"
+    0x0206 -> "Lock-on: Flexible Spot L"
+    0x0207 -> "Lock-on: Expand Flexible Spot"
+    else -> "Unknown (0x${code.toString(16).uppercase().padStart(4, '0')})"
 }
 
 @Composable

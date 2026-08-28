@@ -506,6 +506,51 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         return List(count.coerceAtMost(response.data.size / 4 - 1)) { bb.getInt() }
     }
 
+    /**
+     * Read Sony Focus Area (0xD22C) from GetAllDevicePropData (0x9209).
+     *
+     * ILCE-6600 exposes the AF-area mode on the PTP2/SDIO-v2 path used by
+     * this library. PTP2 does not expose an arbitrary live AF-frame XY
+     * coordinate, so callers must not invent one for Zone/Flexible Spot.
+     */
+    fun getFocusAreaCode(): Int? {
+        val response = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        if (!response.isSuccess || response.data.size < 20) return null
+
+        val data = response.data
+        for (offset in 8 until data.size - 10) {
+            val code = (data[offset].toInt() and 0xFF) or
+                ((data[offset + 1].toInt() and 0xFF) shl 8)
+            if (code != PtpConstants.PROP_SONY_FOCUS_AREA) continue
+
+            val dataType = (data[offset + 2].toInt() and 0xFF) or
+                ((data[offset + 3].toInt() and 0xFF) shl 8)
+            if (dataType !in 1..8) continue
+
+            val valueSize = when (dataType) {
+                1, 2 -> 1
+                3, 4 -> 2 // UINT16/INT16 on ILCE-6600
+                5, 6 -> 4
+                else -> continue
+            }
+
+            // Sony adds one flag byte between default and current values.
+            val currentOffset = offset + 6 + valueSize
+            if (currentOffset + valueSize > data.size) continue
+
+            return when (valueSize) {
+                1 -> data[currentOffset].toInt() and 0xFF
+                2 -> ByteBuffer.wrap(data, currentOffset, 2)
+                    .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                4 -> ByteBuffer.wrap(data, currentOffset, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN).int
+                else -> null
+            }
+        }
+
+        return null
+    }
+
     // ── Sony Photo Transfer Queue ──
 
     data class PhotoQueueStatus(
