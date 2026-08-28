@@ -410,6 +410,21 @@ class UsbCameraConnectionManager(
         return CameraOperationResult.Success
     }
 
+    override suspend fun testAfCenter(): CameraOperationResult = withContext(Dispatchers.IO) {
+        val camera = ptpCamera
+            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
+        try {
+            val message = camera.testAfCenter()
+            _events.emit(CameraEvent.FocusDebug(message))
+            CameraOperationResult.SuccessWithData(message)
+        } catch (e: Exception) {
+            Log.e(TAG, "AF center test failed", e)
+            val message = "AF CENTER TEST exception: ${e.message ?: e.javaClass.simpleName}"
+            _events.emit(CameraEvent.FocusDebug(message))
+            CameraOperationResult.Failure(message)
+        }
+    }
+
     override suspend fun takePhoto(): CameraOperationResult = try {
         // Hard ceiling on total capture time. The retry logic below bounds
         // itself at ~18.5s (10s + 0.5s + 8s queue waits), so 25s absorbs

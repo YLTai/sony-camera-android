@@ -39,6 +39,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     var serialNumber: String? = null
         private set
 
+    @Volatile
+    private var sonyExtensionDebug: String = "ext=not-initialized"
+
     // Reusable BitmapFactory options for liveview decode
     private val decodeOptions = BitmapFactory.Options().apply {
         inPreferredConfig = Bitmap.Config.RGB_565 // Half memory vs ARGB_8888
@@ -188,11 +191,47 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val r2 = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_CONNECT, 2, 0, 0)
         Log.d(TAG, "SDIOConnect(2): ${PtpConstants.responseCodeName(r2.responseCode)}")
 
-        val extInfo = transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO, 0xC8)
-        Log.d(TAG, "GetExtDeviceInfo: ${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
+        // ILCE-7CM2 / A7C II is a newer Sony body. libgphoto2-style Sony
+        // protocol negotiation requests generation 3 (300 / 0x012C) with a
+        // second parameter of 1. Older bodies keep the proven 200 / 0x00C8
+        // path. If the A7C II rejects protocol 3 or returns no extension data,
+        // immediately fall back rather than breaking liveview/capture.
+        val preferProtocol3 = deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true
+        val extV3 = if (preferProtocol3) {
+            transport.sendCommandWithData(
+                PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO,
+                0x012C,
+                1
+            )
+        } else null
+
+        val useProtocol3 = extV3?.isSuccess == true && extV3.dataSize > 0
+        val extInfo = if (useProtocol3) {
+            extV3!!
+        } else {
+            transport.sendCommandWithData(PtpConstants.OP_SONY_SDIO_GET_EXT_DEVICE_INFO, 0x00C8)
+        }
+        val selectedProtocol = if (useProtocol3) 300 else 200
+        Log.d(TAG, "GetExtDeviceInfo protocol=$selectedProtocol: " +
+                "${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
 
         val props = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
         Log.d(TAG, "GetAllDevicePropData: ${PtpConstants.responseCodeName(props.responseCode)}, ${props.dataSize}B")
+
+        sonyExtensionDebug = buildString {
+            append("ext=").append(selectedProtocol)
+            if (preferProtocol3) {
+                append(" v3=")
+                append(PtpConstants.responseCodeName(extV3?.responseCode ?: 0))
+                append("/").append(extV3?.dataSize ?: 0).append("B")
+            }
+            append(" extInfo=")
+            append(PtpConstants.responseCodeName(extInfo.responseCode))
+            append("/").append(extInfo.dataSize).append("B")
+            append(" init9209=")
+            append(PtpConstants.responseCodeName(props.responseCode))
+            append("/").append(props.dataSize).append("B")
+        }
 
         // Tell camera that USB host has control — required before shutter commands work
         setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
@@ -337,6 +376,51 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         Log.d(TAG, "Capture commands sent (af=${PtpConstants.responseCodeName(afResult.responseCode)}, " +
                 "shutter=${PtpConstants.responseCodeName(captureResult.responseCode)})")
         return success
+    }
+
+    /**
+     * Write Sony AF Area Position (0xD2DC) as a uint32 through
+     * SetControlDeviceB (0x9207). Sony protocol uses a 640x480 logical grid;
+     * the packed value is (x << 16) | y.
+     */
+    private fun setAfAreaPosition(x: Int, y: Int): PtpResponse {
+        val safeX = x.coerceIn(0, 639)
+        val safeY = y.coerceIn(0, 479)
+        val packed = (safeX shl 16) or safeY
+        val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(packed)
+            .array()
+        val result = transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
+            data,
+            PtpConstants.PROP_SONY_AF_AREA_POSITION
+        )
+        Log.d(TAG, "Set AF Area Position: x=$safeX y=$safeY packed=0x${packed.toUInt().toString(16)} " +
+                "-> ${PtpConstants.responseCodeName(result.responseCode)}")
+        return result
+    }
+
+    /**
+     * Diagnostic for A7C II: move the Sony logical AF position to the center,
+     * then briefly half-press AF. The camera must be in an AF-capable focus
+     * mode and normally a Spot/Flexible-Spot style focus area for D2DC to have
+     * a visible effect.
+     */
+    fun testAfCenter(): String {
+        val setResult = setAfAreaPosition(320, 240)
+        Thread.sleep(120)
+        val pressResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 2)
+        Thread.sleep(450)
+        val releaseResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 1)
+        return buildString {
+            append("AF CENTER TEST x=320 y=240")
+            append(" | D2DC/9207=")
+            append(PtpConstants.responseCodeName(setResult.responseCode))
+            append(" | halfPress=")
+            append(PtpConstants.responseCodeName(pressResult.responseCode))
+            append(" | release=")
+            append(PtpConstants.responseCodeName(releaseResult.responseCode))
+        }
     }
 
     /**
@@ -654,6 +738,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
         val debug = buildString {
             append("model=").append(deviceName ?: "?")
+            append(" | ").append(sonyExtensionDebug)
             append(" | D22C/9204=")
             append(PtpConstants.responseCodeName(areaDirect.responseCode))
             append(" ").append(areaDirect.dataSize).append("B ").append(fmt16(areaDirectValue))

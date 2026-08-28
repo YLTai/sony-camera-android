@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.service.CameraConnectionClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -189,6 +190,14 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     state = state,
                     onConnect = { lastError = null; camera.connectToCamera() },
                     onCapture = { scope.launch { camera.takePhoto() } },
+                    onAfCenterTest = {
+                        scope.launch {
+                            when (val result = camera.testAfCenter()) {
+                                is CameraOperationResult.Failure -> lastError = result.message
+                                else -> Unit
+                            }
+                        }
+                    },
                     onDisconnect = { camera.disconnect() },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -394,6 +403,7 @@ private fun Controls(
     state: CameraConnectionState,
     onConnect: () -> Unit,
     onCapture: () -> Unit,
+    onAfCenterTest: () -> Unit,
     onDisconnect: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -404,6 +414,14 @@ private fun Controls(
     ) {
         when (state) {
             is CameraConnectionState.Ready -> {
+                Button(
+                    onClick = onAfCenterTest,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.14f)),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.height(42.dp).width(180.dp)
+                ) {
+                    Text("AF CENTER TEST", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
                 ShutterButton(onClick = onCapture)
                 TextButton(onClick = onDisconnect) {
                     Text("Disconnect", color = Color.White.copy(0.7f), fontSize = 13.sp)

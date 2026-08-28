@@ -76,6 +76,9 @@ interface CameraConnectionManager {
     /** Take a photo and return the captured bitmap. */
     suspend fun takePhoto(): CameraOperationResult
 
+    /** Diagnostic: write Sony AF Area Position to the protocol center (320, 240). */
+    suspend fun testAfCenter(): CameraOperationResult
+
     /** Disconnect from the camera. */
     fun disconnect()
 

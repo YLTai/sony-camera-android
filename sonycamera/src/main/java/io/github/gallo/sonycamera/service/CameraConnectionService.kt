@@ -111,6 +111,7 @@ class CameraConnectionService : Service() {
         suspend fun startLiveview() = engine.startLiveview()
         suspend fun stopLiveview() = engine.stopLiveview()
         suspend fun takePhoto() = engine.takePhoto()
+        suspend fun testAfCenter() = engine.testAfCenter()
         fun isReady() = engine.isReady()
         fun disconnect() = this@CameraConnectionService.handleDisconnect()
     }

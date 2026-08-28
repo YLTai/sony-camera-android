@@ -169,6 +169,10 @@ class CameraConnectionClient(
         binderFlow.value?.takePhoto()
             ?: CameraOperationResult.Failure("Camera not connected")
 
+    override suspend fun testAfCenter(): CameraOperationResult =
+        binderFlow.value?.testAfCenter()
+            ?: CameraOperationResult.Failure("Camera not connected")
+
     override fun isReady(): Boolean = binderFlow.value?.isReady() == true
 
     /**
