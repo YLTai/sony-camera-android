@@ -31,6 +31,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Fix Compose imports in patch script
+        run: |
+          sed -i '/import androidx.compose.foundation.layout.matchParentSize/d' tools/apply_landscape_touch_af.py
+          sed -i '/import androidx.compose.foundation.layout.weight/d' tools/apply_landscape_touch_af.py
+          sed -i 's/\.matchParentSize()/\.fillMaxSize()/g' tools/apply_landscape_touch_af.py
+
       - name: Apply landscape touch AF patch
         run: python3 tools/apply_landscape_touch_af.py
 
