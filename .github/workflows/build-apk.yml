@@ -52,3 +52,6 @@ jobs:
           name: sony-camera-demo-debug
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
+
+# Source changes pushed by automation do not retrigger workflows; touching this
+# file from the GitHub connector intentionally starts a fresh validation build.
