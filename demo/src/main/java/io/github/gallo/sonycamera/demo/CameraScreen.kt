@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraFocusFrame
 import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.service.CameraConnectionClient
 import kotlinx.coroutines.delay
@@ -92,6 +93,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var afTargetX by remember { mutableStateOf<Int?>(null) }
             var afTargetY by remember { mutableStateOf<Int?>(null) }
             var afBusy by remember { mutableStateOf(false) }
+            var focusFrames by remember { mutableStateOf<List<CameraFocusFrame>>(emptyList()) }
 
             LaunchedEffect(camera) {
                 camera.liveviewFrames.collect { bitmap ->
@@ -114,6 +116,10 @@ fun CameraScreen(camera: CameraConnectionClient) {
                             afTargetX = event.x
                             afTargetY = event.y
                         }
+                        is CameraEvent.FocusFramesUpdated -> {
+                            focusFrames = event.info.frames
+                            focusEventCount++
+                        }
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
                     }
@@ -125,6 +131,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     focusAreaCode = null
                     afTargetX = null
                     afTargetY = null
+                    focusFrames = emptyList()
                 }
             }
 
@@ -159,6 +166,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         focusDebug = focusDebug,
                         afTargetX = afTargetX,
                         afTargetY = afTargetY,
+                        focusFrames = focusFrames,
                         onConnect = { lastError = null; camera.connectToCamera() },
                         onDisconnect = { camera.disconnect() },
                         modifier = Modifier.width(218.dp).fillMaxHeight()
@@ -167,8 +175,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     PreviewPane(
                         state = state,
                         frame = frame,
-                        afTargetX = afTargetX,
-                        afTargetY = afTargetY,
+                        focusFrames = focusFrames,
                         afBusy = afBusy,
                         onAfPoint = { x, y -> requestAf(x, y) },
                         modifier = Modifier.weight(1f).fillMaxHeight()
@@ -226,8 +233,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
 private fun PreviewPane(
     state: CameraConnectionState,
     frame: Bitmap?,
-    afTargetX: Int?,
-    afTargetY: Int?,
+    focusFrames: List<CameraFocusFrame>,
     afBusy: Boolean,
     onAfPoint: (Int, Int) -> Unit,
     modifier: Modifier = Modifier
@@ -261,12 +267,11 @@ private fun PreviewPane(
                 modifier = Modifier.fillMaxSize()
             )
 
-            if (afTargetX != null && afTargetY != null && containerSize != IntSize.Zero) {
-                AfTargetOverlay(
+            if (focusFrames.isNotEmpty() && containerSize != IntSize.Zero) {
+                CameraFocusOverlay(
                     bitmap = frame,
                     containerSize = containerSize,
-                    x = afTargetX,
-                    y = afTargetY,
+                    frames = focusFrames,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -289,47 +294,65 @@ private fun PreviewPane(
 }
 
 @Composable
-private fun AfTargetOverlay(
+private fun CameraFocusOverlay(
     bitmap: Bitmap,
     containerSize: IntSize,
-    x: Int,
-    y: Int,
+    frames: List<CameraFocusFrame>,
     modifier: Modifier = Modifier
 ) {
     Canvas(modifier = modifier) {
-        val rect = fittedImageRect(containerSize, bitmap.width, bitmap.height)
-        if (rect.width <= 0f || rect.height <= 0f) return@Canvas
+        val imageRect = fittedImageRect(containerSize, bitmap.width, bitmap.height)
+        if (imageRect.width <= 0f || imageRect.height <= 0f) return@Canvas
 
-        val px = rect.left + rect.width * (x.coerceIn(0, 639) / 639f)
-        val py = rect.top + rect.height * (y.coerceIn(0, 479) / 479f)
+        frames.forEach { frame ->
+            if (frame.xDenominator <= 0L || frame.yDenominator <= 0L) return@forEach
 
-        // Visual target area: 64x48 units on Sony's 640x480 logical grid.
-        // This is the app-commanded target box, not a camera-readback of D22C.
-        val areaW = rect.width * (64f / 640f)
-        val areaH = rect.height * (48f / 480f)
-        val left = (px - areaW / 2f).coerceIn(rect.left, rect.right - areaW)
-        val top = (py - areaH / 2f).coerceIn(rect.top, rect.bottom - areaH)
+            val centerX = imageRect.left + imageRect.width * frame.centerXNormalized
+            val centerY = imageRect.top + imageRect.height * frame.centerYNormalized
+            val frameWidth = imageRect.width * frame.widthNormalized
+            val frameHeight = imageRect.height * frame.heightNormalized
+            if (frameWidth <= 0f || frameHeight <= 0f) return@forEach
 
-        drawRect(
-            color = AfGreen,
-            topLeft = Offset(left, top),
-            size = Size(areaW, areaH),
-            style = Stroke(width = 2.5.dp.toPx())
-        )
-        drawCircle(AfGreen, radius = 4.dp.toPx(), center = Offset(px, py))
-        drawLine(
-            color = AfGreen,
-            start = Offset(px - 10.dp.toPx(), py),
-            end = Offset(px + 10.dp.toPx(), py),
-            strokeWidth = 1.5.dp.toPx()
-        )
-        drawLine(
-            color = AfGreen,
-            start = Offset(px, py - 10.dp.toPx()),
-            end = Offset(px, py + 10.dp.toPx()),
-            strokeWidth = 1.5.dp.toPx()
-        )
+            val left = centerX - frameWidth / 2f
+            val right = centerX + frameWidth / 2f
+            val top = centerY - frameHeight / 2f
+            val bottom = centerY + frameHeight / 2f
+            val color = when (frame.state) {
+                0x0002 -> AfGreen                  // Focused
+                0x0003, 0x0004 -> DebugGold       // Selection / moving
+                0x0005 -> Accent                   // Range limit
+                else -> Color.White                // Not focused / other
+            }
+            val stroke = if (isAssistFocusFrame(frame.type)) 1.35.dp.toPx() else 2.15.dp.toPx()
+
+            if (frame.type == 0x0010) {
+                // Sony's protocol explicitly identifies this focus frame as Cross.
+                drawLine(color, Offset(left, centerY), Offset(right, centerY), stroke)
+                drawLine(color, Offset(centerX, top), Offset(centerX, bottom), stroke)
+            } else {
+                // Sony bodies render most AF regions as corner brackets. The
+                // geometry itself (center/width/height) is camera supplied.
+                val corner = (min(frameWidth, frameHeight) * 0.28f)
+                    .coerceIn(4.dp.toPx(), 18.dp.toPx())
+
+                drawLine(color, Offset(left, top), Offset(left + corner, top), stroke)
+                drawLine(color, Offset(left, top), Offset(left, top + corner), stroke)
+                drawLine(color, Offset(right, top), Offset(right - corner, top), stroke)
+                drawLine(color, Offset(right, top), Offset(right, top + corner), stroke)
+                drawLine(color, Offset(left, bottom), Offset(left + corner, bottom), stroke)
+                drawLine(color, Offset(left, bottom), Offset(left, bottom - corner), stroke)
+                drawLine(color, Offset(right, bottom), Offset(right - corner, bottom), stroke)
+                drawLine(color, Offset(right, bottom), Offset(right, bottom - corner), stroke)
+            }
+        }
     }
+}
+
+private fun isAssistFocusFrame(type: Int): Boolean = when (type) {
+    0x0007, // ContrastFlexibleAssist
+    0x000C, // DualAFAssist
+    0x000E -> true // NonDualAFAssist
+    else -> false
 }
 
 private fun fittedImageRect(container: IntSize, imageWidth: Int, imageHeight: Int): Rect {
@@ -358,6 +381,7 @@ private fun LeftRail(
     focusDebug: String,
     afTargetX: Int?,
     afTargetY: Int?,
+    focusFrames: List<CameraFocusFrame>,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     modifier: Modifier = Modifier
@@ -368,17 +392,36 @@ private fun LeftRail(
     ) {
         StatusBlock(state, cameraName)
 
-        Text("AF TARGET", color = DebugGold, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        Text("CAMERA AF", color = DebugGold, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        val primaryFrame = focusFrames.minByOrNull { it.priority }
+        if (primaryFrame != null) {
+            val cameraX = (primaryFrame.centerXNormalized * 639f).toInt().coerceIn(0, 639)
+            val cameraY = (primaryFrame.centerYNormalized * 479f).toInt().coerceIn(0, 479)
+            val cameraW = (primaryFrame.widthNormalized * 640f).toInt().coerceAtLeast(1)
+            val cameraH = (primaryFrame.heightNormalized * 480f).toInt().coerceAtLeast(1)
+            Text(
+                "${focusFrameTypeLabel(primaryFrame.type)} · ${focusFrameStateLabel(primaryFrame.state)}",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                "X $cameraX  Y $cameraY   ${cameraW}×${cameraH}   frames=${focusFrames.size}",
+                color = Color.White.copy(alpha = 0.72f),
+                fontSize = 9.sp
+            )
+        } else {
+            Text("Waiting for FocalFrameInfo…", color = Color.White.copy(alpha = 0.68f), fontSize = 10.sp)
+        }
         Text(
-            if (afTargetX != null && afTargetY != null) "X $afTargetX   Y $afTargetY" else "Tap preview to set",
-            color = Color.White,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold
+            "Mode: ${focusAreaCode?.let(::focusAreaLabel) ?: "unknown"}",
+            color = Color.White.copy(alpha = 0.68f),
+            fontSize = 9.sp
         )
         Text(
-            "Area: ${focusAreaCode?.let(::focusAreaLabel) ?: "commanded Spot target"}",
-            color = Color.White.copy(alpha = 0.68f),
-            fontSize = 10.sp
+            if (afTargetX != null && afTargetY != null) "Last command: X $afTargetX  Y $afTargetY" else "Tap preview to set AF target",
+            color = Color.White.copy(alpha = 0.48f),
+            fontSize = 8.sp
         )
 
         Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.10f)))
@@ -479,6 +522,37 @@ private fun StatusBlock(state: CameraConnectionState, cameraName: String?) {
         Spacer(Modifier.width(8.dp))
         Text(label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
+}
+
+private fun focusFrameTypeLabel(type: Int): String = when (type) {
+    0x0001 -> "Phase Detect AF Sensor"
+    0x0002 -> "Phase Detect Image Sensor"
+    0x0003 -> "Wide"
+    0x0004 -> "Zone"
+    0x0005 -> "Central Emphasis"
+    0x0006 -> "Flexible Main"
+    0x0007 -> "Flexible Assist"
+    0x0008 -> "Contrast"
+    0x0009 -> "Contrast Upper"
+    0x000A -> "Contrast Lower"
+    0x000B -> "Dual AF Main"
+    0x000C -> "Dual AF Assist"
+    0x000D -> "Non-Dual AF Main"
+    0x000E -> "Non-Dual AF Assist"
+    0x000F -> "Frame Somewhere"
+    0x0010 -> "Cross"
+    else -> "Type 0x${type.toString(16).uppercase().padStart(4, '0')}"
+}
+
+private fun focusFrameStateLabel(state: Int): String = when (state) {
+    0x0001 -> "Not focused"
+    0x0002 -> "Focused"
+    0x0003 -> "Selected"
+    0x0004 -> "Moving"
+    0x0005 -> "Range limit"
+    0x0006 -> "Registration AF"
+    0x0007 -> "Island"
+    else -> "State 0x${state.toString(16).uppercase().padStart(4, '0')}"
 }
 
 private fun focusAreaLabel(code: Int): String = when (code) {

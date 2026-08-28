@@ -18,6 +18,8 @@ import android.util.Log
 import io.github.gallo.sonycamera.CameraConnectionManager
 import io.github.gallo.sonycamera.CameraConnectionState
 import io.github.gallo.sonycamera.CameraEvent
+import io.github.gallo.sonycamera.CameraFocusFrame
+import io.github.gallo.sonycamera.CameraFocusFrameInfo
 import io.github.gallo.sonycamera.CameraOperationResult
 import io.github.gallo.sonycamera.ptp.PtpConstants
 import io.github.gallo.sonycamera.ptp.PtpTransport
@@ -291,6 +293,7 @@ class UsbCameraConnectionManager(
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
             var pipeRecoveryAttempts = 0
+            var lastFocusFrameInfo: CameraFocusFrameInfo? = null
             // Time-based stall detection: trip pipe recovery when we haven't
             // seen a successful frame in a long time, rather than after a few
             // denials in a row. Normal Sony behavior during zoom / AF bursts
@@ -311,7 +314,8 @@ class UsbCameraConnectionManager(
             while (isActive && isLiveviewActive) {
                 try {
                     val frameStart = System.currentTimeMillis()
-                    val jpeg = ptpCamera?.getLiveViewFrame()
+                    val liveFrame = ptpCamera?.getLiveViewFrameData()
+                    val jpeg = liveFrame?.jpeg
 
                     if (jpeg != null) {
                         val bitmap = BitmapFactory.decodeByteArray(
@@ -320,6 +324,30 @@ class UsbCameraConnectionManager(
                         if (bitmap != null) {
                             _liveviewFrames.emit(bitmap)
                         }
+
+                        liveFrame.focusFrameInfo?.let { rawInfo ->
+                            val cameraInfo = CameraFocusFrameInfo(
+                                version = rawInfo.version,
+                                frames = rawInfo.frames.map { rawFrame ->
+                                    CameraFocusFrame(
+                                        type = rawFrame.type,
+                                        state = rawFrame.state,
+                                        priority = rawFrame.priority,
+                                        xNumerator = rawFrame.xNumerator,
+                                        yNumerator = rawFrame.yNumerator,
+                                        xDenominator = rawFrame.xDenominator,
+                                        yDenominator = rawFrame.yDenominator,
+                                        width = rawFrame.width,
+                                        height = rawFrame.height
+                                    )
+                                }
+                            )
+                            if (cameraInfo != lastFocusFrameInfo) {
+                                lastFocusFrameInfo = cameraInfo
+                                _events.emit(CameraEvent.FocusFramesUpdated(cameraInfo))
+                            }
+                        }
+
                         frameCount++
                         consecutiveErrors = 0
                         hasEverGottenFrame = true

@@ -21,6 +21,28 @@ import java.nio.ByteOrder
  *   Poll GetObject(handle=0xFFFFC002) to receive JPEG frames (~140KB each).
  *   Response data contains raw JPEG starting at the SOI marker (0xFFD8).
  */
+data class SonyFocusFrame(
+    val type: Int,
+    val state: Int,
+    val priority: Int,
+    val xNumerator: Long,
+    val yNumerator: Long,
+    val xDenominator: Long,
+    val yDenominator: Long,
+    val width: Long,
+    val height: Long
+)
+
+data class SonyFocusFrameInfo(
+    val version: Int,
+    val frames: List<SonyFocusFrame>
+)
+
+data class SonyLiveViewFrame(
+    val jpeg: ByteArray,
+    val focusFrameInfo: SonyFocusFrameInfo?
+)
+
 class SonyPtpCamera(private val transport: PtpTransport) {
 
     companion object {
@@ -41,6 +63,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
     @Volatile
     private var sonyExtensionDebug: String = "ext=not-initialized"
+
+    @Volatile
+    private var loggedLiveViewDataset = false
 
     // Reusable BitmapFactory options for liveview decode
     private val decodeOptions = BitmapFactory.Options().apply {
@@ -259,10 +284,15 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
-     * Get a single liveview frame as JPEG bytes.
-     * Polls GetObject(0xFFFFC002) — the Sony liveview magic handle.
+     * Get one Sony live-view dataset.
+     *
+     * Camera Control PTP 3 defines object 0xFFFFC002 as a dataset whose first
+     * four UINT32 values are: image offset, image size, FocalFrameInfo offset,
+     * and FocalFrameInfo size. Keeping the two payloads together lets callers
+     * render the exact focus-frame geometry returned for this live-view frame.
+     * Older protocol-2 bodies fall back to the historical JPEG-SOI scan.
      */
-    fun getLiveViewFrame(): ByteArray? {
+    fun getLiveViewFrameData(): SonyLiveViewFrame? {
         val response = transport.sendCommandWithData(
             PtpConstants.OP_GET_OBJECT,
             PtpConstants.LIVEVIEW_OBJECT_HANDLE
@@ -270,15 +300,10 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
         if (!response.isSuccess) {
             consecutiveLiveviewErrors++
-            // Sporadic Access Denied (1-2 between frames) is normal — only log sustained errors
             if (consecutiveLiveviewErrors == 5 || consecutiveLiveviewErrors % 200 == 0) {
                 Log.w(TAG, "Liveview: ${PtpConstants.responseCodeName(response.responseCode)} " +
                         "(consecutive=$consecutiveLiveviewErrors)")
             }
-            // Previously drained the interrupt endpoint on every Access Denied,
-            // but events are on a different endpoint and don't affect bulk
-            // frame polling — the drain just cost ~30ms per slow frame, which
-            // halved effective FPS during zoom/AF where denials spike.
             return null
         }
 
@@ -289,8 +314,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
         consecutiveLiveviewErrors = 0
 
-        return extractJpeg(response.data)
+        return parseLiveViewDataset(response.data)
     }
+
+    /** Compatibility helper for callers that only need the JPEG. */
+    fun getLiveViewFrame(): ByteArray? = getLiveViewFrameData()?.jpeg
 
     /**
      * Get a liveview frame decoded as a Bitmap. Uses RGB_565 for efficiency.
@@ -1026,6 +1054,121 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         while (drained < 20) {
             val event = transport.readEvent(30) ?: break
             drained++
+        }
+    }
+
+    private fun parseLiveViewDataset(data: ByteArray): SonyLiveViewFrame? {
+        if (data.size >= 16) {
+            val header = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+            val imageOffset = header.int.toLong() and 0xFFFFFFFFL
+            val imageSize = header.int.toLong() and 0xFFFFFFFFL
+            val focusOffset = header.int.toLong() and 0xFFFFFFFFL
+            val focusSize = header.int.toLong() and 0xFFFFFFFFL
+
+            val imageEnd = imageOffset + imageSize
+            val validImage = imageOffset >= 16L && imageSize >= 3L &&
+                    imageOffset <= data.size.toLong() &&
+                    imageEnd >= imageOffset && imageEnd <= data.size.toLong()
+
+            if (validImage) {
+                val imageStartInt = imageOffset.toInt()
+                val imageEndInt = imageEnd.toInt()
+                val rawImage = data.copyOfRange(imageStartInt, imageEndInt)
+                val jpeg = extractJpeg(rawImage) ?: rawImage
+
+                val focusEnd = focusOffset + focusSize
+                val validFocus = focusSize > 0L && focusOffset >= 16L &&
+                        focusOffset <= data.size.toLong() &&
+                        focusEnd >= focusOffset && focusEnd <= data.size.toLong()
+                val focusInfo = if (validFocus) {
+                    parseFocalFrameInfo(data, focusOffset.toInt(), focusSize.toInt())
+                } else {
+                    null
+                }
+
+                if (!loggedLiveViewDataset) {
+                    loggedLiveViewDataset = true
+                    Log.d(
+                        TAG,
+                        "PTP3 LiveView dataset: image@$imageOffset/${imageSize}B " +
+                                "focus@$focusOffset/${focusSize}B " +
+                                "frames=${focusInfo?.frames?.size ?: 0} " +
+                                "focusVersion=${focusInfo?.version ?: 0}"
+                    )
+                }
+                return SonyLiveViewFrame(jpeg = jpeg, focusFrameInfo = focusInfo)
+            }
+        }
+
+        // Protocol-2 / legacy fallback: there may be no dataset header.
+        val jpeg = extractJpeg(data) ?: return null
+        return SonyLiveViewFrame(jpeg = jpeg, focusFrameInfo = null)
+    }
+
+    /** Parse Sony Camera Control PTP 3 FocalFrameInfo, little-endian. */
+    private fun parseFocalFrameInfo(
+        data: ByteArray,
+        offset: Int,
+        size: Int
+    ): SonyFocusFrameInfo? {
+        if (offset < 0 || size < 72 || offset + size > data.size) return null
+
+        return try {
+            val bb = ByteBuffer.wrap(data, offset, size).slice().order(ByteOrder.LITTLE_ENDIAN)
+
+            fun u16(): Int = bb.short.toInt() and 0xFFFF
+            fun u32(): Long = bb.int.toLong() and 0xFFFFFFFFL
+            fun skip(count: Int): Boolean {
+                if (count < 0 || bb.remaining() < count) return false
+                bb.position(bb.position() + count)
+                return true
+            }
+
+            if (bb.remaining() < 8) return null
+            val version = u16()
+            if (!skip(6)) return null
+
+            if (!skip(40) || bb.remaining() < 8) return null
+            val reservedArrayNum = u16()
+            if (!skip(6)) return null
+
+            if (reservedArrayNum > bb.remaining() / 24) return null
+            if (!skip(reservedArrayNum * 24)) return null
+
+            if (bb.remaining() < 16) return null
+            val xDenominator = u32()
+            val yDenominator = u32()
+            val frameNum = u16()
+            if (!skip(6)) return null
+
+            val readableFrames = minOf(frameNum, bb.remaining() / 24)
+            val frames = ArrayList<SonyFocusFrame>(readableFrames)
+            repeat(readableFrames) {
+                val type = u16()
+                val state = u16()
+                val priority = bb.get().toInt() and 0xFF
+                if (!skip(3)) return null
+                val xNumerator = u32()
+                val yNumerator = u32()
+                val height = u32()
+                val width = u32()
+                frames += SonyFocusFrame(
+                    type = type,
+                    state = state,
+                    priority = priority,
+                    xNumerator = xNumerator,
+                    yNumerator = yNumerator,
+                    xDenominator = xDenominator,
+                    yDenominator = yDenominator,
+                    width = width,
+                    height = height
+                )
+            }
+
+            SonyFocusFrameInfo(version = version, frames = frames)
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to parse FocalFrameInfo: ${e.message}")
+            null
         }
     }
 
