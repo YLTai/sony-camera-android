@@ -820,11 +820,24 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     private val exposureDescriptors = linkedMapOf<CameraExposureSetting, ExposureDescriptor>()
     @Volatile private var exposureDescriptorsProbed = false
 
-    /** Probe the property ids once per PTP session, before liveview starts. */
+    /**
+     * Discover exposure controls once per PTP session.
+     *
+     * Modern Sony protocol-3 bodies expose FNumber / Shutter / ISO in
+     * GetAllDevicePropData (0x9209), but may not support 0x9204 or 0x9206.
+     * Treat 0x9209 as the primary discovery/readback source and retain the
+     * older per-property operations only as compatibility fallbacks.
+     */
     @Synchronized
     private fun ensureExposureDescriptors(force: Boolean = false) {
         if (exposureDescriptorsProbed && !force) return
         exposureDescriptors.clear()
+
+        val snapshot = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+            2_000
+        )
+        val snapshotData = if (snapshot.isSuccess) snapshot.data else ByteArray(0)
 
         val candidates = linkedMapOf(
             CameraExposureSetting.APERTURE to intArrayOf(PtpConstants.PROP_PTP_F_NUMBER),
@@ -839,17 +852,53 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         )
 
         candidates.forEach { (setting, ids) ->
-            probeExposureDescriptor(setting, ids)?.let { descriptor ->
-                exposureDescriptors[setting] = descriptor
+            val knownType = when (setting) {
+                CameraExposureSetting.APERTURE -> 0x0004 // UINT16, f-number x100
+                CameraExposureSetting.SHUTTER_SPEED,
+                CameraExposureSetting.ISO -> 0x0006 // UINT32
+            }
+
+            var fromSnapshot: ExposureDescriptor? = null
+            for (propertyCode in ids) {
+                val offset = findSonyPropertyOffset(snapshotData, propertyCode, knownType) ?: continue
+                val writable = (snapshotData.getOrNull(offset + 4)?.toInt()?.and(0xFF) ?: 0) != 0
+                val seed = ExposureDescriptor(
+                    setting = setting,
+                    propertyCode = propertyCode,
+                    dataType = knownType,
+                    writable = writable,
+                    initialValue = null,
+                    enumValues = emptyList(),
+                    rangeMin = null,
+                    rangeMax = null
+                )
+                fromSnapshot = seed.copy(
+                    initialValue = readCurrentFromAllProperties(snapshotData, seed)
+                )
+                break
+            }
+
+            val descriptor = fromSnapshot ?: probeExposureDescriptor(setting, ids)
+            descriptor?.let {
+                exposureDescriptors[setting] = it
                 Log.d(
                     TAG,
-                    "Exposure ${setting.name}: prop=0x${descriptor.propertyCode.toString(16)} " +
-                        "type=0x${descriptor.dataType.toString(16)} writable=${descriptor.writable} " +
-                        "choices=${descriptor.enumValues.size} current=${descriptor.initialValue}"
+                    "Exposure ${setting.name}: prop=0x${it.propertyCode.toString(16)} " +
+                        "type=0x${it.dataType.toString(16)} writable=${it.writable} " +
+                        "choices=${it.enumValues.size} current=${it.initialValue} " +
+                        "source=${if (fromSnapshot != null) "9209" else "legacy"}"
                 )
             }
         }
         exposureDescriptorsProbed = true
+    }
+
+    private fun findSonyPropertyOffset(data: ByteArray, propertyCode: Int, dataType: Int): Int? {
+        if (data.size < 6) return null
+        for (i in 0 until data.size - 5) {
+            if (u16(data, i) == propertyCode && u16(data, i + 2) == dataType) return i
+        }
+        return null
     }
 
     private fun probeExposureDescriptor(
@@ -1225,20 +1274,39 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     ): Long? {
         val size = scalarSize(descriptor.dataType)
         if (size !in 1..4) return null
-        for (i in 8 until data.size - 5) {
+        for (i in 0 until data.size - 5) {
             if (u16(data, i) != descriptor.propertyCode) continue
             if (u16(data, i + 2) != descriptor.dataType) continue
 
-            // Sony's GetAllDevicePropData adds one flag byte between default
-            // and current. This is the layout already used for D215 in this app.
-            val sonyCurrentOffset = i + 6 + size
-            readUnsignedScalar(data, sonyCurrentOffset, size)?.let { return it }
+            // Sony GetAllDevicePropData commonly inserts one flag byte between
+            // default and current; retain the standard PTP layout as fallback.
+            val sonyCurrent = readUnsignedScalar(data, i + 6 + size, size)
+            if (sonyCurrent != null && isPlausibleExposureRaw(descriptor.setting, sonyCurrent)) {
+                return sonyCurrent
+            }
 
-            // Defensive fallback for bodies that use standard PTP layout.
-            val standardCurrentOffset = i + 5 + size
-            readUnsignedScalar(data, standardCurrentOffset, size)?.let { return it }
+            val standardCurrent = readUnsignedScalar(data, i + 5 + size, size)
+            if (standardCurrent != null && isPlausibleExposureRaw(descriptor.setting, standardCurrent)) {
+                return standardCurrent
+            }
         }
         return null
+    }
+
+    private fun isPlausibleExposureRaw(setting: CameraExposureSetting, raw: Long): Boolean = when (setting) {
+        CameraExposureSetting.APERTURE -> raw in 80L..10000L
+        CameraExposureSetting.ISO -> {
+            val low24 = raw and 0x00FFFFFFL
+            raw == 0x00FFFFFFL || low24 in 25L..819200L
+        }
+        CameraExposureSetting.SHUTTER_SPEED -> {
+            if (raw == 0L) true // BULB
+            else {
+                val numerator = (raw ushr 16) and 0xFFFF
+                val denominator = raw and 0xFFFF
+                numerator > 0L && denominator > 0L
+            }
+        }
     }
 
     private fun scalarSize(dataType: Int): Int = when (dataType) {
