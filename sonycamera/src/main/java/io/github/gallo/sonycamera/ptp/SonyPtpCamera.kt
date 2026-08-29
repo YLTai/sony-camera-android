@@ -865,20 +865,27 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             var fromSnapshot: ExposureDescriptor? = null
             for (propertyCode in ids) {
                 val offset = findSonyPropertyOffset(snapshotData, propertyCode, knownType) ?: continue
-                val writable = (snapshotData.getOrNull(offset + 4)?.toInt()?.and(0xFF) ?: 0) != 0
-                val seed = ExposureDescriptor(
-                    setting = setting,
-                    propertyCode = propertyCode,
-                    dataType = knownType,
-                    writable = writable,
-                    initialValue = null,
-                    enumValues = emptyList(),
-                    rangeMin = null,
-                    rangeMax = null
-                )
-                fromSnapshot = seed.copy(
-                    initialValue = readCurrentFromAllProperties(snapshotData, seed)
-                )
+
+                // 0x9209 contains full DevicePropDesc-shaped records on protocol-3
+                // bodies. Parse the form section as well as the current value so a
+                // zoom lens can report its real F-number floor/ceiling and choices.
+                fromSnapshot = parseExposureDescriptor(snapshotData, setting, propertyCode)
+                if (fromSnapshot == null) {
+                    val writable = (snapshotData.getOrNull(offset + 4)?.toInt()?.and(0xFF) ?: 0) != 0
+                    val seed = ExposureDescriptor(
+                        setting = setting,
+                        propertyCode = propertyCode,
+                        dataType = knownType,
+                        writable = writable,
+                        initialValue = null,
+                        enumValues = emptyList(),
+                        rangeMin = null,
+                        rangeMax = null
+                    )
+                    fromSnapshot = seed.copy(
+                        initialValue = readCurrentFromAllProperties(snapshotData, seed)
+                    )
+                }
                 break
             }
 
@@ -890,6 +897,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                     "Exposure ${setting.name}: prop=0x${it.propertyCode.toString(16)} " +
                         "type=0x${it.dataType.toString(16)} writable=${it.writable} " +
                         "choices=${it.enumValues.size} current=${it.initialValue} " +
+                        "range=${it.rangeMin ?: "?"}..${it.rangeMax ?: "?"} " +
                         "source=${if (fromSnapshot != null) "9209" else "legacy"}"
                 )
             }
@@ -956,9 +964,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         setting: CameraExposureSetting,
         expectedCode: Int
     ): ExposureDescriptor? {
-        // 9206 normally starts with code/type/getSet, but scan the first few
-        // bytes as newer Sony generations occasionally prepend small metadata.
-        val starts = (0..minOf(12, data.size - 5)).filter { offset ->
+        // This parser is shared by the small 0x9206 response and the complete
+        // 0x9209 snapshot. Scan the whole blob; structural validation below rejects
+        // accidental occurrences of the property code inside another value.
+        if (data.size < 5) return null
+        val starts = (0 until (data.size - 4)).filter { offset ->
             u16(data, offset) == expectedCode
         }
         if (starts.isEmpty()) return null
@@ -971,6 +981,12 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val parsed = mutableListOf<Candidate>()
         for (base in starts) {
             val type = u16(data, base + 2)
+            val expectedType = when (setting) {
+                CameraExposureSetting.APERTURE -> 0x0004
+                CameraExposureSetting.SHUTTER_SPEED,
+                CameraExposureSetting.ISO -> 0x0006
+            }
+            if (type != expectedType) continue
             val size = scalarSize(type)
             if (size !in 1..4) continue
             val getSet = data[base + 4].toInt() and 0xFF
@@ -1015,7 +1031,8 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 var score = 2
                 if (getSet != 0) score += 2
                 if (enumValues.size > 1) score += 3
-                if (rangeMin != null && rangeMax != null) score += 1
+                if (rangeMin != null && rangeMax != null) score += 2
+                if (current != null && isPlausibleExposureRaw(setting, current)) score += 2
                 if (sonyExtraFlag) score += 1 // 9206/9209 Sony data commonly uses this layout.
 
                 parsed += Candidate(
@@ -1190,10 +1207,24 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             options.firstOrNull { it.rawValue == raw }
                 ?: CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
         }
+        // Aperture limits are lens-specific. Prefer explicit descriptor range
+        // bounds; enum-only lenses still provide authoritative first/last F values.
+        val minimum = if (descriptor.setting == CameraExposureSetting.APERTURE) {
+            (descriptor.rangeMin ?: raws.minOrNull())?.let { raw ->
+                CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
+            }
+        } else null
+        val maximum = if (descriptor.setting == CameraExposureSetting.APERTURE) {
+            (descriptor.rangeMax ?: raws.maxOrNull())?.let { raw ->
+                CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
+            }
+        } else null
         return CameraExposureProperty(
             current = current,
             options = options,
-            writable = descriptor.writable && options.size > 1
+            writable = descriptor.writable && options.size > 1,
+            minimum = minimum,
+            maximum = maximum
         )
     }
 
@@ -1403,6 +1434,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             var values = descriptor.enumValues.distinct()
             if (values.size < 2) {
                 values = fallbackCameraSettingValues(setting)
+            }
+            if (setting == CameraSetting.EXPOSURE_COMPENSATION && values.isNotEmpty()) {
+                values = values.sortedBy { raw ->
+                    (raw and 0xFFFF).toInt().toShort().toInt()
+                }
             }
             val current = descriptor.currentValue
             val mutable = values.toMutableList()

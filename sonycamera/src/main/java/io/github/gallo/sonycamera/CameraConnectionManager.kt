@@ -54,7 +54,11 @@ data class CameraExposureOption(
 data class CameraExposureProperty(
     val current: CameraExposureOption?,
     val options: List<CameraExposureOption>,
-    val writable: Boolean
+    val writable: Boolean,
+    /** Lower adjustable limit reported/derived from the active lens descriptor. */
+    val minimum: CameraExposureOption? = null,
+    /** Upper adjustable limit reported/derived from the active lens descriptor. */
+    val maximum: CameraExposureOption? = null
 )
 
 data class CameraExposureState(

@@ -214,3 +214,106 @@ private fun calculateHistogram(source: Bitmap): HistogramSnapshot {
     }
     return HistogramSnapshot(bins, sampled)
 }
+
+
+/** Composition guides are monitor-only and never alter the camera image. */
+internal enum class CompositionGuide(val label: String) {
+    OFF("OFF"),
+    THIRDS("3×3"),
+    GOLDEN("GOLD"),
+    CENTER("CROSS"),
+    DIAGONALS("DIAG"),
+    SAFE("SAFE")
+}
+
+internal fun nextCompositionGuide(current: CompositionGuide): CompositionGuide {
+    val values = CompositionGuide.entries
+    return values[(current.ordinal + 1) % values.size]
+}
+
+/**
+ * Draw a composition overlay inside the fitted live-view image rect. Keeping
+ * this layer outside PreviewPane's magnification transform means guides remain
+ * a stable monitor reference while the operator punches in for focus.
+ */
+@Composable
+internal fun CompositionGuideOverlay(
+    source: Bitmap?,
+    guide: CompositionGuide,
+    modifier: Modifier = Modifier
+) {
+    if (guide == CompositionGuide.OFF || source == null || source.width <= 0 || source.height <= 0) return
+
+    Canvas(modifier) {
+        if (size.width <= 0f || size.height <= 0f) return@Canvas
+        val sourceAspect = source.width.toFloat() / source.height.toFloat()
+        val canvasAspect = size.width / size.height
+        val imageWidth: Float
+        val imageHeight: Float
+        if (canvasAspect > sourceAspect) {
+            imageHeight = size.height
+            imageWidth = imageHeight * sourceAspect
+        } else {
+            imageWidth = size.width
+            imageHeight = imageWidth / sourceAspect
+        }
+        val left = (size.width - imageWidth) / 2f
+        val top = (size.height - imageHeight) / 2f
+        val right = left + imageWidth
+        val bottom = top + imageHeight
+        val lineColor = Color.White.copy(alpha = 0.56f)
+        val secondary = Color.Black.copy(alpha = 0.42f)
+        val thin = 1.dp.toPx()
+
+        fun guideLine(x1: Float, y1: Float, x2: Float, y2: Float) {
+            // A subtle dark under-stroke keeps white guides legible on highlights.
+            drawLine(secondary, androidx.compose.ui.geometry.Offset(x1, y1), androidx.compose.ui.geometry.Offset(x2, y2), thin * 2.4f)
+            drawLine(lineColor, androidx.compose.ui.geometry.Offset(x1, y1), androidx.compose.ui.geometry.Offset(x2, y2), thin)
+        }
+
+        when (guide) {
+            CompositionGuide.OFF -> Unit
+            CompositionGuide.THIRDS -> {
+                for (fraction in listOf(1f / 3f, 2f / 3f)) {
+                    val x = left + imageWidth * fraction
+                    val y = top + imageHeight * fraction
+                    guideLine(x, top, x, bottom)
+                    guideLine(left, y, right, y)
+                }
+            }
+            CompositionGuide.GOLDEN -> {
+                for (fraction in listOf(0.382f, 0.618f)) {
+                    val x = left + imageWidth * fraction
+                    val y = top + imageHeight * fraction
+                    guideLine(x, top, x, bottom)
+                    guideLine(left, y, right, y)
+                }
+            }
+            CompositionGuide.CENTER -> {
+                val cx = (left + right) / 2f
+                val cy = (top + bottom) / 2f
+                guideLine(cx, top, cx, bottom)
+                guideLine(left, cy, right, cy)
+                val arm = minOf(imageWidth, imageHeight) * 0.035f
+                guideLine(cx - arm, cy, cx + arm, cy)
+                guideLine(cx, cy - arm, cx, cy + arm)
+            }
+            CompositionGuide.DIAGONALS -> {
+                guideLine(left, top, right, bottom)
+                guideLine(right, top, left, bottom)
+            }
+            CompositionGuide.SAFE -> {
+                val insetX = imageWidth * 0.05f
+                val insetY = imageHeight * 0.05f
+                val l = left + insetX
+                val r = right - insetX
+                val t = top + insetY
+                val b = bottom - insetY
+                guideLine(l, t, r, t)
+                guideLine(r, t, r, b)
+                guideLine(r, b, l, b)
+                guideLine(l, b, l, t)
+            }
+        }
+    }
+}

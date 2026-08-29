@@ -16,6 +16,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -120,6 +121,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var peakingLevel by remember { mutableStateOf(PeakingLevel.OFF) }
             var zebraThreshold by remember { mutableStateOf<Int?>(null) }
             var histogramEnabled by remember { mutableStateOf(false) }
+            var compositionGuide by remember { mutableStateOf(CompositionGuide.OFF) }
             var magnification by remember { mutableStateOf(1f) }
             var magnifyPivot by remember { mutableStateOf(Offset(0.5f, 0.5f)) }
 
@@ -233,6 +235,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     focusFrames = focusFrames,
                     peakingLevel = peakingLevel,
                     zebraThreshold = zebraThreshold,
+                    compositionGuide = compositionGuide,
                     magnification = magnification,
                     magnifyPivot = magnifyPivot,
                     afBusy = afBusy,
@@ -303,12 +306,14 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         peakingLevel = peakingLevel,
                         zebraThreshold = zebraThreshold,
                         histogramEnabled = histogramEnabled,
+                        compositionGuide = compositionGuide,
                         magnification = magnification,
                         lutEnabled = lutEnabled,
                         lutName = selectedLut?.displayName,
                         onPeaking = { peakingLevel = nextPeakingLevel(peakingLevel) },
                         onZebra = { zebraThreshold = nextZebraThreshold(zebraThreshold) },
                         onHistogram = { histogramEnabled = !histogramEnabled },
+                        onCompositionGuide = { compositionGuide = nextCompositionGuide(compositionGuide) },
                         onMagnify = {
                             magnification = nextMagnification(magnification)
                             if (magnification == 1f) magnifyPivot = Offset(0.5f, 0.5f)
@@ -324,11 +329,13 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 if (menusVisible) {
                     activeExposure?.let { setting ->
                         exposure?.property(setting)?.let { property ->
-                            OptionSelectorPanel(
+                            DialSelectorPanel(
                                 title = exposureTitle(setting),
                                 currentRaw = property.current?.rawValue,
                                 options = property.options.map { SelectorOption(it.rawValue, it.label) },
                                 writable = property.writable,
+                                minimumLabel = if (setting == CameraExposureSetting.APERTURE) property.minimum?.label else null,
+                                maximumLabel = if (setting == CameraExposureSetting.APERTURE) property.maximum?.label else null,
                                 onSelect = { raw -> setExposure(setting, raw) },
                                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
                             )
@@ -336,14 +343,28 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     }
                     activeSetting?.let { setting ->
                         cameraSettings?.property(setting)?.let { property ->
-                            OptionSelectorPanel(
-                                title = cameraSettingTitle(setting),
-                                currentRaw = property.current?.rawValue,
-                                options = property.options.map { SelectorOption(it.rawValue, it.label) },
-                                writable = property.writable,
-                                onSelect = { raw -> setCameraSetting(setting, raw) },
-                                modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
-                            )
+                            val selectorOptions = property.options.map { SelectorOption(it.rawValue, it.label) }
+                            if (setting == CameraSetting.EXPOSURE_COMPENSATION) {
+                                DialSelectorPanel(
+                                    title = cameraSettingTitle(setting),
+                                    currentRaw = property.current?.rawValue,
+                                    options = selectorOptions,
+                                    writable = property.writable,
+                                    minimumLabel = selectorOptions.firstOrNull()?.label,
+                                    maximumLabel = selectorOptions.lastOrNull()?.label,
+                                    onSelect = { raw -> setCameraSetting(setting, raw) },
+                                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
+                                )
+                            } else {
+                                OptionSelectorPanel(
+                                    title = cameraSettingTitle(setting),
+                                    currentRaw = property.current?.rawValue,
+                                    options = selectorOptions,
+                                    writable = property.writable,
+                                    onSelect = { raw -> setCameraSetting(setting, raw) },
+                                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 78.dp)
+                                )
+                            }
                         }
                     }
                     if (showLutPanel) {
@@ -438,6 +459,7 @@ private fun PreviewPane(
     focusFrames: List<CameraFocusFrame>,
     peakingLevel: PeakingLevel,
     zebraThreshold: Int?,
+    compositionGuide: CompositionGuide,
     magnification: Float,
     magnifyPivot: Offset,
     afBusy: Boolean,
@@ -535,6 +557,12 @@ private fun PreviewPane(
                     )
                 }
             }
+
+            CompositionGuideOverlay(
+                source = source,
+                guide = compositionGuide,
+                modifier = Modifier.fillMaxSize()
+            )
 
             if (magnification > 1f) {
                 Text(
@@ -783,12 +811,14 @@ private fun MonitorToolRail(
     peakingLevel: PeakingLevel,
     zebraThreshold: Int?,
     histogramEnabled: Boolean,
+    compositionGuide: CompositionGuide,
     magnification: Float,
     lutEnabled: Boolean,
     lutName: String?,
     onPeaking: () -> Unit,
     onZebra: () -> Unit,
     onHistogram: () -> Unit,
+    onCompositionGuide: () -> Unit,
     onMagnify: () -> Unit,
     onLut: () -> Unit
 ) {
@@ -799,6 +829,7 @@ private fun MonitorToolRail(
         SonyToolButton("PEAK", peakingLevel.label, peakingLevel != PeakingLevel.OFF, onPeaking)
         SonyToolButton("ZEBRA", zebraThreshold?.let { "$it%" } ?: "OFF", zebraThreshold != null, onZebra)
         SonyToolButton("HIST", if (histogramEnabled) "ON" else "OFF", histogramEnabled, onHistogram)
+        SonyToolButton("GUIDE", compositionGuide.label, compositionGuide != CompositionGuide.OFF, onCompositionGuide)
         SonyToolButton("MAG", "${magnification.toInt()}×", magnification > 1f, onMagnify)
         SonyToolButton("LUT", if (lutEnabled) (lutName?.take(8) ?: "ON") else "OFF", lutEnabled, onLut)
     }
@@ -823,6 +854,164 @@ private fun SonyToolButton(title: String, value: String, active: Boolean, onClic
 }
 
 private data class SelectorOption(val rawValue: Long, val label: String)
+
+/**
+ * Sony-style virtual control dial for ordered settings. Drag left/right to turn
+ * through camera-reported steps; only the final detent is sent over USB so a
+ * fast finger movement never queues dozens of PTP writes behind live view.
+ */
+@Composable
+private fun DialSelectorPanel(
+    title: String,
+    currentRaw: Long?,
+    options: List<SelectorOption>,
+    writable: Boolean,
+    minimumLabel: String? = null,
+    maximumLabel: String? = null,
+    onSelect: (Long) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var previewIndex by remember(options, currentRaw) {
+        val index = options.indexOfFirst { it.rawValue == currentRaw }
+        mutableStateOf(if (index >= 0) index else 0)
+    }
+    var dragRemainder by remember { mutableStateOf(0f) }
+    var dragging by remember { mutableStateOf(false) }
+
+    LaunchedEffect(currentRaw, options, dragging) {
+        if (!dragging) {
+            val index = options.indexOfFirst { it.rawValue == currentRaw }
+            if (index >= 0) previewIndex = index
+        }
+    }
+
+    Surface(
+        modifier = modifier.fillMaxWidth(0.72f).widthIn(max = 690.dp),
+        color = SonyPanel,
+        shape = RoundedCornerShape(3.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.24f)),
+        shadowElevation = 8.dp
+    ) {
+        Column(Modifier.padding(horizontal = 11.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    if (writable) "TURN / SWIPE DIAL" else "DISPLAY ONLY",
+                    color = if (writable) Color.White.copy(alpha = 0.44f) else Accent,
+                    fontSize = 7.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                if (minimumLabel != null || maximumLabel != null) {
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        listOfNotNull(
+                            minimumLabel?.let { "MIN  $it" },
+                            maximumLabel?.let { "MAX  $it" }
+                        ).joinToString("     "),
+                        color = Color.White.copy(alpha = 0.68f),
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            Spacer(Modifier.height(5.dp))
+
+            if (options.isEmpty()) {
+                Text("No adjustable steps reported by camera", color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
+            } else {
+                val safeIndex = previewIndex.coerceIn(0, options.lastIndex)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(78.dp)
+                        .background(Color.Black.copy(alpha = 0.28f), RoundedCornerShape(2.dp))
+                        .pointerInput(options, writable) {
+                            if (!writable || options.size < 2) return@pointerInput
+                            detectHorizontalDragGestures(
+                                onDragStart = {
+                                    dragging = true
+                                    dragRemainder = 0f
+                                },
+                                onHorizontalDrag = { _, dragAmount ->
+                                    dragRemainder += dragAmount
+                                    val detent = 28.dp.toPx()
+                                    while (dragRemainder <= -detent) {
+                                        previewIndex = (previewIndex + 1).coerceAtMost(options.lastIndex)
+                                        dragRemainder += detent
+                                    }
+                                    while (dragRemainder >= detent) {
+                                        previewIndex = (previewIndex - 1).coerceAtLeast(0)
+                                        dragRemainder -= detent
+                                    }
+                                },
+                                onDragEnd = {
+                                    dragging = false
+                                    dragRemainder = 0f
+                                    options.getOrNull(previewIndex)?.let { selected ->
+                                        if (selected.rawValue != currentRaw) onSelect(selected.rawValue)
+                                    }
+                                },
+                                onDragCancel = {
+                                    dragging = false
+                                    dragRemainder = 0f
+                                    val index = options.indexOfFirst { it.rawValue == currentRaw }
+                                    if (index >= 0) previewIndex = index
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        val center = size.width / 2f
+                        val spacing = 28.dp.toPx()
+                        val bottom = size.height
+                        for (tick in -10..10) {
+                            val x = center + tick * spacing
+                            if (x < 0f || x > size.width) continue
+                            val major = tick % 2 == 0
+                            val h = if (major) 15.dp.toPx() else 9.dp.toPx()
+                            drawLine(
+                                color = Color.White.copy(alpha = if (major) 0.34f else 0.18f),
+                                start = Offset(x, bottom - h),
+                                end = Offset(x, bottom),
+                                strokeWidth = 1.dp.toPx()
+                            )
+                        }
+                        drawLine(
+                            color = Accent,
+                            start = Offset(center, 0f),
+                            end = Offset(center, bottom),
+                            strokeWidth = 2.dp.toPx()
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        for (delta in -2..2) {
+                            val option = options.getOrNull(safeIndex + delta)
+                            Box(Modifier.width(92.dp), contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = option?.label ?: "",
+                                    color = if (delta == 0) Color.White else Color.White.copy(alpha = if (kotlin.math.abs(delta) == 1) 0.50f else 0.24f),
+                                    fontSize = if (delta == 0) 20.sp else if (kotlin.math.abs(delta) == 1) 11.sp else 9.sp,
+                                    lineHeight = if (delta == 0) 23.sp else 13.sp,
+                                    fontWeight = if (delta == 0) FontWeight.Bold else FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun OptionSelectorPanel(
