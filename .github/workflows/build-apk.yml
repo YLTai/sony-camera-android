@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -16,17 +16,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Apply live dial interaction fixes
-        run: |
-          if [ -f tools/apply_dial_live_round4.py ]; then
-            python tools/apply_dial_live_round4.py
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "fix: make monitor dials continuous and live"
-            git push
-          fi
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -64,4 +53,4 @@ jobs:
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
 
-# One-shot validation build for continuous, live-sampled monitor dials.
+# Latest validation target: continuous scrolling dials with conflated live camera updates.
