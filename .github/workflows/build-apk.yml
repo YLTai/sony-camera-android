@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -16,6 +16,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply monitor UI round 5
+        run: |
+          python3 tools/apply_monitor_ui_round5.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add demo/src/main/java/io/github/gallo/sonycamera/demo/CameraScreen.kt sonycamera/src/main/java/io/github/gallo/sonycamera/ptp/SonyPtpCamera.kt tools/apply_monitor_ui_round5.py
+          git commit -m "fix: refine monitor UI and exposure locks"
+          git push origin HEAD:main
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -52,5 +63,3 @@ jobs:
           name: sony-camera-demo-debug
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
-
-# Latest validation target: continuous scrolling dials with conflated live camera updates.
