@@ -17,14 +17,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Apply a7C II fixes
+      - name: Apply a7C II connection fixes
         run: |
-          if [ -f tools/apply_a7c2_round1.py ]; then
-            python tools/apply_a7c2_round1.py
+          if [ -f tools/apply_a7c2_connection_round2.py ]; then
+            python tools/apply_a7c2_connection_round2.py
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
-            git commit -m "fix: improve a7C II live view controls"
+            git commit -m "fix: stabilize a7C II PC Remote connection"
             git push
           fi
 
@@ -64,4 +64,4 @@ jobs:
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
 
-# One-shot source patch + validation build for a7C II.
+# One-shot source patch + validation build for a7C II connection reliability.
