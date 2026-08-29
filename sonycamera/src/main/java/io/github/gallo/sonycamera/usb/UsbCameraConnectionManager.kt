@@ -44,6 +44,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * USB PTP camera connection engine for Sony cameras.
@@ -69,6 +70,9 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
+        // Always leave a tiny idle bus window after a successful frame so a
+        // monitor tap can claim PTP before the next GetObject starts.
+        private const val LIVEVIEW_CONTROL_GAP_MS = 12L
         private const val EXPOSURE_POLL_INTERVAL_MS = 250L
         private const val SETTINGS_POLL_INTERVAL_MS = 900L
         private const val TELEMETRY_WARMUP_MS = 700L
@@ -125,6 +129,7 @@ class UsbCameraConnectionManager(
     @Volatile private var controlEpoch = 0L
     @Volatile private var telemetryResumeAtMs = 0L
     @Volatile private var controlWriteActive = false
+    private val priorityControlIntents = AtomicInteger(0)
     @Volatile private var afHalfPressHeld = false
     private var afReleaseJob: Job? = null
     private var afGeneration = 0L
@@ -353,7 +358,7 @@ class UsbCameraConnectionManager(
                     // Do not start another GetObject while a user control is waiting.
                     // The PTP transaction already in flight is allowed to finish; then
                     // AF/exposure gets the bus before the next live-view frame.
-                    if (controlWriteActive) {
+                    if (priorityControlIntents.get() > 0 || controlWriteActive) {
                         delay(2)
                         continue
                     }
@@ -404,7 +409,7 @@ class UsbCameraConnectionManager(
                         // settings reads in the same frame iteration. App-originated writes already
                         // publish their result immediately; these polls are only for camera-side dials.
                         val telemetryNow = System.currentTimeMillis()
-                        if (!controlWriteActive &&
+                        if (priorityControlIntents.get() == 0 && !controlWriteActive &&
                             telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS &&
                             telemetryNow >= telemetryResumeAtMs
                         ) {
@@ -435,8 +440,11 @@ class UsbCameraConnectionManager(
 
                         // Pace: ensure minimum interval between successful frames
                         val elapsed = System.currentTimeMillis() - frameStart
-                        val sleepMs = LIVEVIEW_MIN_FRAME_INTERVAL_MS - elapsed
-                        if (sleepMs > 0) delay(sleepMs)
+                        val sleepMs = maxOf(
+                            LIVEVIEW_MIN_FRAME_INTERVAL_MS - elapsed,
+                            LIVEVIEW_CONTROL_GAP_MS
+                        )
+                        delay(sleepMs)
                     } else {
                         errorCount++
                         consecutiveErrors++
@@ -508,82 +516,93 @@ class UsbCameraConnectionManager(
         return CameraOperationResult.Success
     }
 
-    override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult = withContext(Dispatchers.IO) {
-        controlWriteMutex.withLock {
-            val camera = ptpCamera
-                ?: return@withLock CameraOperationResult.Failure("Camera not connected")
-            val safeX = x.coerceIn(0, 639)
-            val safeY = y.coerceIn(0, 479)
-            val epoch = beginControlWrite()
-            try {
-                val started = System.currentTimeMillis()
+    override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
+        // Publish the intent on the caller's thread BEFORE hopping to Dispatchers.IO
+        // or waiting for controlWriteMutex. This closes the race where Live View
+        // checked controlWriteActive=false and queued another GetObject first.
+        val requestedAtMs = System.currentTimeMillis()
+        priorityControlIntents.incrementAndGet()
+        return try {
+            withContext(Dispatchers.IO) {
+                controlWriteMutex.withLock {
+                    val camera = ptpCamera
+                        ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+                    val safeX = x.coerceIn(0, 639)
+                    val safeY = y.coerceIn(0, 479)
+                    val epoch = beginControlWrite()
+                    try {
+                        val commandStartedMs = System.currentTimeMillis()
+                        val dispatchWaitMs = commandStartedMs - requestedAtMs
 
-                // Match Sony Camera Remote SDK / monitor-style touch control:
-                // one D2E4 RemoteTouchOperation performs the touch action at x/y.
-                // Do NOT decompose a normal a7C II tap into D2DC + shutter S1;
-                // that doubles PTP round trips and is observably less responsive.
-                if (camera.supportsRemoteTouch()) {
-                    val touch = camera.executeRemoteTouch(safeX, safeY)
-                    if (camera.supportsRemoteTouch()) {
-                        val elapsed = System.currentTimeMillis() - started
-                        val message = "REMOTE TOUCH x=$safeX y=$safeY | D2E4/9207=" +
-                            PtpConstants.responseCodeName(touch.responseCode) + " | ${elapsed}ms"
-                        Log.d(TAG, message)
-                        _events.emit(CameraEvent.FocusDebug(message))
-                        _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-                        // A late/missing ACK is not grounds for a second AF action:
-                        // Sony controls take effect when the data phase lands. Only
-                        // an explicit Unsupported response disables this path.
-                        return@withLock CameraOperationResult.SuccessWithData(message)
-                    }
-                    Log.w(TAG, "Remote Touch unsupported by body; using legacy AF fallback")
-                }
-
-                // Compatibility fallback for bodies without Remote Touch.
-                // Keep the previous move + S1 behavior isolated here; a7C II
-                // should never use it unless the camera explicitly rejects D2E4.
-                afReleaseJob?.cancel()
-                afReleaseJob = null
-                afGeneration += 1L
-                val generation = afGeneration
-                if (afHalfPressHeld) {
-                    camera.setAutofocusPressed(false)
-                    afHalfPressHeld = false
-                }
-                val moveMessage = camera.setAfPoint(safeX, safeY)
-                val pressResult = camera.setAutofocusPressed(true)
-                afHalfPressHeld = true
-                val message = "$moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)}"
-                Log.d(TAG, "Legacy AF point+press completed in ${System.currentTimeMillis() - started}ms")
-                _events.emit(CameraEvent.FocusDebug(message))
-                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-
-                afReleaseJob = scope.launch(Dispatchers.IO) {
-                    delay(320)
-                    controlWriteMutex.withLock {
-                        if (generation != afGeneration || ptpCamera !== camera || !afHalfPressHeld) {
-                            return@withLock
+                        // ILCE-7CM2 monitor taps use one Sony Remote Touch action.
+                        // The transport call is explicitly high-priority; Live View
+                        // never queues in front of it and drops a frame if PTP is busy.
+                        if (camera.supportsRemoteTouch()) {
+                            val touch = camera.executeRemoteTouch(safeX, safeY)
+                            if (camera.supportsRemoteTouch()) {
+                                val finishedMs = System.currentTimeMillis()
+                                val commandMs = finishedMs - commandStartedMs
+                                val wireAndAckMs = (commandMs - touch.queueWaitMs).coerceAtLeast(0L)
+                                val totalMs = finishedMs - requestedAtMs
+                                val message = "REMOTE TOUCH x=$safeX y=$safeY | D2E4/9207=" +
+                                    PtpConstants.responseCodeName(touch.responseCode) +
+                                    " | dispatch=${dispatchWaitMs}ms bus=${touch.queueWaitMs}ms" +
+                                    " wire+ack=${wireAndAckMs}ms total=${totalMs}ms"
+                                Log.d(TAG, message)
+                                _events.emit(CameraEvent.FocusDebug(message))
+                                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                                return@withLock CameraOperationResult.SuccessWithData(message)
+                            }
+                            Log.w(TAG, "Remote Touch unsupported by body; using legacy AF fallback")
                         }
-                        val releaseEpoch = beginControlWrite()
-                        try {
+
+                        // Compatibility fallback for bodies without Remote Touch.
+                        afReleaseJob?.cancel()
+                        afReleaseJob = null
+                        afGeneration += 1L
+                        val generation = afGeneration
+                        if (afHalfPressHeld) {
                             camera.setAutofocusPressed(false)
                             afHalfPressHeld = false
-                        } catch (e: Exception) {
-                            Log.w(TAG, "AF half-press release failed: ${e.message}")
-                        } finally {
-                            endControlWrite(releaseEpoch)
                         }
+                        val moveMessage = camera.setAfPoint(safeX, safeY)
+                        val pressResult = camera.setAutofocusPressed(true)
+                        afHalfPressHeld = true
+                        val message = "$moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)}"
+                        Log.d(TAG, "Legacy AF point+press completed in ${System.currentTimeMillis() - commandStartedMs}ms")
+                        _events.emit(CameraEvent.FocusDebug(message))
+                        _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+
+                        afReleaseJob = scope.launch(Dispatchers.IO) {
+                            delay(320)
+                            controlWriteMutex.withLock {
+                                if (generation != afGeneration || ptpCamera !== camera || !afHalfPressHeld) {
+                                    return@withLock
+                                }
+                                val releaseEpoch = beginControlWrite()
+                                try {
+                                    camera.setAutofocusPressed(false)
+                                    afHalfPressHeld = false
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "AF half-press release failed: ${e.message}")
+                                } finally {
+                                    endControlWrite(releaseEpoch)
+                                }
+                            }
+                        }
+                        CameraOperationResult.SuccessWithData(message)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "AF target command failed", e)
+                        val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
+                        _events.emit(CameraEvent.FocusDebug(message))
+                        CameraOperationResult.Failure(message)
+                    } finally {
+                        endControlWrite(epoch)
                     }
                 }
-                CameraOperationResult.SuccessWithData(message)
-            } catch (e: Exception) {
-                Log.e(TAG, "AF target command failed", e)
-                val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
-                _events.emit(CameraEvent.FocusDebug(message))
-                CameraOperationResult.Failure(message)
-            } finally {
-                endControlWrite(epoch)
             }
+        } finally {
+            priorityControlIntents.decrementAndGet()
         }
     }
 
@@ -837,6 +856,7 @@ class UsbCameraConnectionManager(
         afReleaseJob = null
         afHalfPressHeld = false
         controlWriteActive = false
+        priorityControlIntents.set(0)
 
         // Cancel any in-flight connect so its finally-block unwinds the
         // resources it allocated rather than silently committing them after

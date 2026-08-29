@@ -314,11 +314,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // Live view is a continuous low-priority producer. Never allow one
         // busy frame request to hold the shared PTP transport for the global
         // 5-second timeout while the user is waiting on AF/exposure control.
-        val response = transport.sendCommandWithDataShortTimeout(
+        val response = transport.trySendCommandWithDataShortTimeout(
             PtpConstants.OP_GET_OBJECT,
             450,
             PtpConstants.LIVEVIEW_OBJECT_HANDLE
-        )
+        ) ?: return null
 
         if (!response.isSuccess) {
             consecutiveLiveviewErrors++
@@ -446,7 +446,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(packed)
             .array()
-        val result = transport.sendCommandWithDataOut(
+        val result = transport.sendHighPriorityCommandWithDataOut(
             PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
             data,
             PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION

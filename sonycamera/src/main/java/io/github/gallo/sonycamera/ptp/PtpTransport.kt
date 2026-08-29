@@ -6,6 +6,7 @@ import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -37,7 +38,12 @@ class PtpTransport(
     // and must be atomic relative to any other caller, or we desync the pipe.
     // ReentrantLock — not Mutex — because callers are blocking and we want a
     // public method to be safe to call from within another public method.
-    private val lock = ReentrantLock(true) // fair: waiting user controls run before the next live-view poll
+    private val lock = ReentrantLock(true) // fair for operations that intentionally wait
+
+    // Live View is a disposable producer; user controls are not. A high-priority
+    // control advertises itself before waiting on the PTP lock so a Live View
+    // poll that has not started yet can yield instead of barging into the queue.
+    private val highPriorityWaiters = AtomicInteger(0)
 
     private var transactionId = 0
 
@@ -171,6 +177,39 @@ class PtpTransport(
      * Useful for probing handles that might not have data (avoids 10s default timeout).
      */
     fun sendCommandWithDataShortTimeout(operationCode: Int, timeoutMs: Int, vararg params: Int): PtpDataResponse = lock.withLock {
+        sendCommandWithDataShortTimeoutLocked(operationCode, timeoutMs, params)
+    }
+
+    /**
+     * Low-priority variant used by the continuous Live View producer.
+     *
+     * Crucially this NEVER queues behind another PTP operation. If telemetry or
+     * a user control owns the transport, the caller simply drops this frame and
+     * tries again later. That prevents a queued GetObject from sitting in front
+     * of a monitor tap in the fair ReentrantLock wait queue.
+     */
+    fun trySendCommandWithDataShortTimeout(
+        operationCode: Int,
+        timeoutMs: Int,
+        vararg params: Int
+    ): PtpDataResponse? {
+        if (highPriorityWaiters.get() > 0) return null
+        if (!lock.tryLock()) return null
+        return try {
+            // Untimed tryLock may barge on a fair ReentrantLock. Re-check after
+            // acquisition so a control that announced itself during the race wins.
+            if (highPriorityWaiters.get() > 0) null
+            else sendCommandWithDataShortTimeoutLocked(operationCode, timeoutMs, params)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private fun sendCommandWithDataShortTimeoutLocked(
+        operationCode: Int,
+        timeoutMs: Int,
+        params: IntArray
+    ): PtpDataResponse {
         val txId = nextTransactionId()
 
         val paramBytes = params.size * 4
@@ -187,15 +226,14 @@ class PtpTransport(
 
         val sent = connection.bulkTransfer(bulkOut, buffer.array(), containerLength, timeoutMs)
         if (sent < 0) {
-            return@withLock PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
+            return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
         }
 
-        // Read with short timeout
         val headerBuf = ByteArray(PtpConstants.USB_TRANSFER_BUFFER_SIZE)
         val read = connection.bulkTransfer(bulkIn, headerBuf, headerBuf.size, timeoutMs)
 
         if (read < PtpConstants.HEADER_SIZE) {
-            return@withLock PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
+            return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
         }
 
         val bb = ByteBuffer.wrap(headerBuf, 0, read).order(ByteOrder.LITTLE_ENDIAN)
@@ -205,14 +243,13 @@ class PtpTransport(
         val responseTxId = bb.getInt()
 
         if (type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
-            return@withLock PtpDataResponse(code, responseTxId, ByteArray(0))
+            return PtpDataResponse(code, responseTxId, ByteArray(0))
         }
 
         if (type != PtpConstants.CONTAINER_TYPE_DATA) {
-            return@withLock PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
+            return PtpDataResponse(PtpConstants.RESP_GENERAL_ERROR, txId, ByteArray(0))
         }
 
-        // Collect data
         val dataSize = totalLength - PtpConstants.HEADER_SIZE
         val output = ByteArrayOutputStream(dataSize.coerceAtMost(PtpConstants.USB_TRANSFER_BUFFER_SIZE))
         val firstChunkSize = read - PtpConstants.HEADER_SIZE
@@ -230,7 +267,7 @@ class PtpTransport(
 
         val data = output.toByteArray()
         val response = readResponse(txId, timeoutMs)
-        PtpDataResponse(response.responseCode, responseTxId, data)
+        return PtpDataResponse(response.responseCode, responseTxId, data)
     }
 
     /**
@@ -242,9 +279,38 @@ class PtpTransport(
      * @return PtpResponse with response code
      */
     fun sendCommandWithDataOut(operationCode: Int, data: ByteArray, vararg params: Int): PtpResponse = lock.withLock {
+        sendCommandWithDataOutLocked(operationCode, data, params)
+    }
+
+    /**
+     * Priority path for latency-sensitive monitor controls such as Sony Remote Touch.
+     * The waiter is announced BEFORE blocking on the transport lock, which makes
+     * low-priority Live View polling yield immediately rather than queue ahead.
+     */
+    fun sendHighPriorityCommandWithDataOut(
+        operationCode: Int,
+        data: ByteArray,
+        vararg params: Int
+    ): PtpResponse {
+        val queuedAtMs = System.currentTimeMillis()
+        highPriorityWaiters.incrementAndGet()
+        lock.lock()
+        val queueWaitMs = System.currentTimeMillis() - queuedAtMs
+        return try {
+            sendCommandWithDataOutLocked(operationCode, data, params).copy(queueWaitMs = queueWaitMs)
+        } finally {
+            lock.unlock()
+            highPriorityWaiters.decrementAndGet()
+        }
+    }
+
+    private fun sendCommandWithDataOutLocked(
+        operationCode: Int,
+        data: ByteArray,
+        params: IntArray
+    ): PtpResponse {
         val txId = nextTransactionId()
 
-        // Send command container
         val paramBytes = params.size * 4
         val cmdLength = PtpConstants.HEADER_SIZE + paramBytes
         val cmdBuffer = ByteBuffer.allocate(cmdLength).order(ByteOrder.LITTLE_ENDIAN)
@@ -259,10 +325,9 @@ class PtpTransport(
         var sent = connection.bulkTransfer(bulkOut, cmdBuffer.array(), cmdLength, PtpConstants.USB_TIMEOUT_MS)
         if (sent < 0) {
             Log.e(TAG, "DataOut cmd 0x${operationCode.toString(16)} send failed (bulkTransfer=$sent)")
-            return@withLock PtpResponse(PtpConstants.RESP_GENERAL_ERROR, txId)
+            return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, txId)
         }
 
-        // Send data container
         val dataLength = PtpConstants.HEADER_SIZE + data.size
         val dataBuffer = ByteBuffer.allocate(dataLength).order(ByteOrder.LITTLE_ENDIAN)
         dataBuffer.putInt(dataLength)
@@ -274,10 +339,10 @@ class PtpTransport(
         sent = connection.bulkTransfer(bulkOut, dataBuffer.array(), dataLength, PtpConstants.USB_TIMEOUT_MS)
         if (sent < 0) {
             Log.e(TAG, "DataOut data phase send failed (bulkTransfer=$sent)")
-            return@withLock PtpResponse(PtpConstants.RESP_GENERAL_ERROR, txId)
+            return PtpResponse(PtpConstants.RESP_GENERAL_ERROR, txId)
         }
 
-        readResponseQuick(txId)
+        return readResponseQuick(txId)
     }
 
     /**
@@ -576,7 +641,9 @@ class PtpTransport(
 data class PtpResponse(
     val responseCode: Int,
     val transactionId: Int,
-    val params: IntArray = IntArray(0)
+    val params: IntArray = IntArray(0),
+    /** Time spent waiting for the shared PTP bus on an explicitly priority call. */
+    val queueWaitMs: Long = 0L
 ) {
     val isSuccess: Boolean get() = PtpConstants.isSuccess(responseCode)
     override fun toString(): String = "PtpResponse(${PtpConstants.responseCodeName(responseCode)}, txId=$transactionId)"
