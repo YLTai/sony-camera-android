@@ -19,13 +19,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply immediate S1 AF fix
+      - name: Remove stale AF trigger reference
         run: |
-          python3 tools/apply_immediate_s1_fix.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('sonycamera/src/main/java/io/github/gallo/sonycamera/usb/UsbCameraConnectionManager.kt')
+          s = p.read_text()
+          old = '        afTriggerJob = null\n'
+          if old not in s:
+              raise SystemExit('stale afTriggerJob assignment not found')
+          p.write_text(s.replace(old, '', 1))
+          PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix: trigger S1 immediately after AF-area move"
+          git commit -m "fix: remove stale AF trigger teardown reference"
           git push origin HEAD:main
 
       - name: Setup Java 17
