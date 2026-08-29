@@ -73,7 +73,6 @@ class UsbCameraConnectionManager(
         private const val SETTINGS_POLL_INTERVAL_MS = 3_000L
         private const val TELEMETRY_WARMUP_MS = 2_000L
         private const val CONTROL_POLL_QUIET_MS = 1_000L
-        private const val FIRST_LIVEVIEW_PROBE_MS = 4_000L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -436,9 +435,13 @@ class UsbCameraConnectionManager(
                         // user is prompted to do that.
                         val sinceStart = System.currentTimeMillis() - liveviewStartTime
                         if (!hasEverGottenFrame && sinceStart > neverGotFrameFatalMs) {
-                            Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms — releasing stale USB session")
+                            Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms; keeping the established PC Remote session")
                             isLiveviewActive = false
-                            scope.launch { handleFatalConnectionLoss("Liveview did not recover") }
+                            scope.launch {
+                                _events.emit(CameraEvent.Error(
+                                    "Camera is connected, but Live View did not start. Disconnect and reconnect if the camera remains idle."
+                                ))
+                            }
                             break
                         }
 
@@ -492,36 +495,48 @@ class UsbCameraConnectionManager(
     }
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult = withContext(Dispatchers.IO) {
-        val camera = ptpCamera
-            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
-        val safeX = x.coerceIn(0, 639)
-        val safeY = y.coerceIn(0, 479)
-        try {
-            val message = camera.setAfPoint(safeX, safeY)
-            _events.emit(CameraEvent.FocusDebug(message))
-            _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-            CameraOperationResult.SuccessWithData(message)
-        } catch (e: Exception) {
-            Log.e(TAG, "AF target command failed", e)
-            val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
-            _events.emit(CameraEvent.FocusDebug(message))
-            CameraOperationResult.Failure(message)
+        controlWriteMutex.withLock {
+            val camera = ptpCamera
+                ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+            val safeX = x.coerceIn(0, 639)
+            val safeY = y.coerceIn(0, 479)
+            val epoch = beginControlWrite()
+            try {
+                val started = System.currentTimeMillis()
+                val message = camera.setAfPoint(safeX, safeY)
+                Log.d(TAG, "AF area position command completed in ${System.currentTimeMillis() - started}ms")
+                _events.emit(CameraEvent.FocusDebug(message))
+                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                CameraOperationResult.SuccessWithData(message)
+            } catch (e: Exception) {
+                Log.e(TAG, "AF target command failed", e)
+                val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
+                _events.emit(CameraEvent.FocusDebug(message))
+                CameraOperationResult.Failure(message)
+            } finally {
+                endControlWrite(epoch)
+            }
         }
     }
 
     override suspend fun testAfCenter(): CameraOperationResult = withContext(Dispatchers.IO) {
-        val camera = ptpCamera
-            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
-        try {
-            val message = camera.testAfCenter()
-            _events.emit(CameraEvent.FocusDebug(message))
-            _events.emit(CameraEvent.AfTargetUpdated(320, 240))
-            CameraOperationResult.SuccessWithData(message)
-        } catch (e: Exception) {
-            Log.e(TAG, "AF center test failed", e)
-            val message = "AF CENTER TEST exception: ${e.message ?: e.javaClass.simpleName}"
-            _events.emit(CameraEvent.FocusDebug(message))
-            CameraOperationResult.Failure(message)
+        controlWriteMutex.withLock {
+            val camera = ptpCamera
+                ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+            val epoch = beginControlWrite()
+            try {
+                val message = camera.testAfCenter()
+                _events.emit(CameraEvent.FocusDebug(message))
+                _events.emit(CameraEvent.AfTargetUpdated(320, 240))
+                CameraOperationResult.SuccessWithData(message)
+            } catch (e: Exception) {
+                Log.e(TAG, "AF center test failed", e)
+                val message = "AF CENTER TEST exception: ${e.message ?: e.javaClass.simpleName}"
+                _events.emit(CameraEvent.FocusDebug(message))
+                CameraOperationResult.Failure(message)
+            } finally {
+                endControlWrite(epoch)
+            }
         }
     }
 
@@ -976,45 +991,23 @@ class UsbCameraConnectionManager(
                 Log.w(TAG, "Could not get device info, continuing with generic Sony identity")
             }
 
-            // The vendor handshake alone is not enough to declare success on a7C II.
-            // A stale remote owner can accept SDIO commands yet deny 0xFFFFC002 forever.
-            // Verify the real live-view object first. If that fails, reproduce the useful
-            // part of a clean Monitor+ open/close cycle: release priority, CloseSession,
-            // then reopen and run the complete protocol-3 handshake exactly once.
-            var remoteReady = localCamera.initSonyExtension() && probeLiveViewReady(localCamera)
-            if (!remoteReady) {
-                Log.w(TAG, "Sony remote session not stream-ready — recycling PC Remote session once")
-                runCatching { localCamera.endSession() }
-                    .onFailure { Log.w(TAG, "Remote-session release failed: ${it.message}") }
-                runCatching { localCamera.flushAndResetPipe() }
-                delay(350)
-
-                localCamera = SonyPtpCamera(transport)
-                var reopened = localCamera.openSession()
-                if (!reopened) {
-                    Log.w(TAG, "Recycled OpenSession failed — using one class-reset recovery")
-                    transport.recoverAfterFailedOpenSession(localIface.id)
-                    localCamera = SonyPtpCamera(transport)
-                    reopened = localCamera.openSession()
-                }
-
-                if (reopened) {
-                    if (!localCamera.getDeviceInfo()) {
-                        Log.w(TAG, "Could not refresh device info after remote-session recycle")
-                    }
-                    remoteReady = localCamera.initSonyExtension() && probeLiveViewReady(localCamera)
-                }
-            }
-
+            // Sony Camera Remote Command treats connection setup and live-view
+            // retrieval as separate operations. Once OpenSession + the documented
+            // SDIO vendor handshake succeeds, publish the device as connected. Do
+            // not recycle a valid session merely because the first live-view object
+            // is late; that speculative reopen path was a major source of long
+            // "Camera Initializing" stalls on the a7C II.
+            val handshakeStarted = System.currentTimeMillis()
+            val remoteReady = localCamera.initSonyExtension()
+            Log.d(TAG, "Sony SDIO handshake completed=${remoteReady} in " +
+                    "${System.currentTimeMillis() - handshakeStarted}ms")
             if (!remoteReady) {
                 _connectionState.value = CameraConnectionState.Error(
-                    "a7C II PC Remote session did not become stream-ready. Set USB Connection Mode to PC Remote, USB LUN to Single, and Network > PC Remote Function > PC Remote to Off, then reconnect."
+                    "Sony PC Remote handshake failed. Close other camera-control apps, verify PC Remote USB mode, then reconnect."
                 )
                 return@withContext
             }
 
-            // Commit only after a real live-view dataset has been observed. Property
-            // discovery is intentionally deferred until the stream has warmed up.
             usbDevice = device
             usbConnection = localConn
             ptpInterface = localIface
@@ -1022,10 +1015,12 @@ class UsbCameraConnectionManager(
             committed = true
 
             _cameraName.value = localCamera.deviceName ?: "Sony a7C II (USB)"
-            Log.d(TAG, "USB camera stream-ready: ${localCamera.deviceName}")
+            Log.d(TAG, "USB camera connected: ${localCamera.deviceName}; starting liveview separately")
             _connectionState.value = CameraConnectionState.Ready
 
-            Log.d(TAG, "Auto-starting verified USB liveview...")
+            // Live view is a post-connect operation, matching Sony's sample/API
+            // model. The UI can now distinguish a connected camera waiting for
+            // frames from a camera still stuck in the handshake.
             startLiveview()
         } catch (cancel: kotlinx.coroutines.CancellationException) {
             // Caller (disconnect / detach) is tearing us down. Don't flip to Error —
@@ -1048,28 +1043,6 @@ class UsbCameraConnectionManager(
                 try { localConn?.close() } catch (e: Exception) { Log.w(TAG, "connection close rollback: ${e.message}") }
             }
         }
-    }
-
-    private suspend fun probeLiveViewReady(camera: SonyPtpCamera): Boolean {
-        val started = System.currentTimeMillis()
-        var pipeCleared = false
-        var attempts = 0
-        while (System.currentTimeMillis() - started < FIRST_LIVEVIEW_PROBE_MS) {
-            attempts++
-            val frame = camera.getLiveViewFrameData()
-            if (frame?.jpeg?.isNotEmpty() == true) {
-                Log.d(TAG, "First liveview verified after $attempts attempts / ${System.currentTimeMillis() - started}ms")
-                return true
-            }
-            if (!pipeCleared && System.currentTimeMillis() - started >= 1_200L) {
-                Log.w(TAG, "First liveview still denied — clearing endpoints once")
-                camera.flushAndResetPipe()
-                pipeCleared = true
-            }
-            delay(80)
-        }
-        Log.w(TAG, "First liveview verification failed after $attempts attempts")
-        return false
     }
 
     private fun hasPtpInterface(device: UsbDevice): Boolean = findPtpInterface(device) != null

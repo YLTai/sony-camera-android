@@ -37,7 +37,7 @@ class PtpTransport(
     // and must be atomic relative to any other caller, or we desync the pipe.
     // ReentrantLock — not Mutex — because callers are blocking and we want a
     // public method to be safe to call from within another public method.
-    private val lock = ReentrantLock()
+    private val lock = ReentrantLock(true) // fair: waiting user controls run before the next live-view poll
 
     private var transactionId = 0
 

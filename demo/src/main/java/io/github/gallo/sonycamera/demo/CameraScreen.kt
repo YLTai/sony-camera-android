@@ -118,7 +118,6 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var cameraSettings by remember { mutableStateOf<CameraSettingsState?>(null) }
             var afBusy by remember { mutableStateOf(false) }
             var queuedAfPoint by remember { mutableStateOf<Pair<Int, Int>?>(null) }
-            var optimisticAfPoint by remember { mutableStateOf<Offset?>(null) }
             var afRequestJob by remember { mutableStateOf<Job?>(null) }
 
             var menusVisible by remember { mutableStateOf(true) }
@@ -184,11 +183,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         is CameraEvent.ShutterFired -> flash = true
                         is CameraEvent.FocusFramesUpdated -> {
                             focusFrames = event.info.frames
-                            // Do not let a delayed camera event pull the marker back to
-                            // the previous AF point while a newer tap is being shown.
-                            if (optimisticAfPoint == null) {
-                                focusPoint = preferredFocusPivot(event.info.frames)
-                            }
+                            focusPoint = preferredFocusPivot(event.info.frames)
                         }
                         is CameraEvent.ExposureUpdated -> exposure = event.state
                         is CameraEvent.CameraSettingsUpdated -> cameraSettings = event.state
@@ -210,7 +205,6 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     magnifyPivot = Offset(0.5f, 0.5f)
                     focusPoint = Offset(0.5f, 0.5f)
                     queuedAfPoint = null
-                    optimisticAfPoint = null
                     afRequestJob?.cancel()
                     afRequestJob = null
                     afBusy = false
@@ -240,19 +234,12 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 if (state !is CameraConnectionState.Ready) return
                 val targetX = x.coerceIn(0, 639)
                 val targetY = y.coerceIn(0, 479)
-                val point = Offset(targetX / 639f, targetY / 479f)
 
-                // Give immediate visual feedback. USB remains strictly serialized:
-                // while one setAfPoint is in flight, additional taps only replace
-                // this single queued target instead of starting concurrent writes.
-                focusPoint = point
-                optimisticAfPoint = point
+                // Keep at most one latest target while a USB control is in flight.
+                // We intentionally do NOT draw an optimistic focus frame here: the
+                // monitor now reflects only the camera's returned FocalFrameInfo.
+                focusPoint = Offset(targetX / 639f, targetY / 479f)
                 queuedAfPoint = targetX to targetY
-                scope.launch {
-                    delay(900)
-                    if (optimisticAfPoint == point) optimisticAfPoint = null
-                }
-
                 if (afRequestJob?.isActive == true) return
                 afRequestJob = scope.launch {
                     while (true) {
@@ -295,7 +282,6 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     magnification = magnification,
                     magnifyPivot = magnifyPivot,
                     afBusy = afBusy,
-                    optimisticAfPoint = optimisticAfPoint,
                     onAfPoint = ::requestAf,
                     onMenuVisibility = { menusVisible = it },
                     onMagnificationChange = { zoom, pivot ->
@@ -522,7 +508,6 @@ private fun PreviewPane(
     magnification: Float,
     magnifyPivot: Offset,
     afBusy: Boolean,
-    optimisticAfPoint: Offset?,
     onAfPoint: (Int, Int) -> Unit,
     onMenuVisibility: (Boolean) -> Unit,
     onMagnificationChange: (Float, Offset) -> Unit,
@@ -627,9 +612,6 @@ private fun PreviewPane(
                 )
                 FocusPeakingOverlay(source, peakingLevel, Modifier.fillMaxSize())
                 FocusAreaSelectionOverlay(source, containerSize, focusAreaRaw, focusFrames, Modifier.fillMaxSize())
-                optimisticAfPoint?.let { point ->
-                    OptimisticFocusPointOverlay(source, containerSize, point, Modifier.fillMaxSize())
-                }
                 if (focusFrames.isNotEmpty() && containerSize != IntSize.Zero) {
                     CameraFocusOverlay(
                         bitmap = source,
@@ -1452,38 +1434,6 @@ private fun MagnificationThumbnail(
                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx())
             )
         }
-    }
-}
-
-@Composable
-private fun OptimisticFocusPointOverlay(
-    bitmap: Bitmap,
-    containerSize: IntSize,
-    point: Offset,
-    modifier: Modifier = Modifier
-) {
-    Canvas(modifier) {
-        val r = fittedImageRect(containerSize, bitmap.width, bitmap.height)
-        if (r.width <= 0f || r.height <= 0f) return@Canvas
-        val cx = r.left + r.width * point.x.coerceIn(0f, 1f)
-        val cy = r.top + r.height * point.y.coerceIn(0f, 1f)
-        val halfW = 15.dp.toPx()
-        val halfH = 11.dp.toPx()
-        val corner = 5.dp.toPx()
-        val stroke = 1.6.dp.toPx()
-        val color = AfGreen.copy(alpha = 0.96f)
-        val left = cx - halfW
-        val right = cx + halfW
-        val top = cy - halfH
-        val bottom = cy + halfH
-        drawLine(color, Offset(left, top), Offset(left + corner, top), stroke)
-        drawLine(color, Offset(left, top), Offset(left, top + corner), stroke)
-        drawLine(color, Offset(right, top), Offset(right - corner, top), stroke)
-        drawLine(color, Offset(right, top), Offset(right, top + corner), stroke)
-        drawLine(color, Offset(left, bottom), Offset(left + corner, bottom), stroke)
-        drawLine(color, Offset(left, bottom), Offset(left, bottom - corner), stroke)
-        drawLine(color, Offset(right, bottom), Offset(right - corner, bottom), stroke)
-        drawLine(color, Offset(right, bottom), Offset(right, bottom - corner), stroke)
     }
 }
 

@@ -416,8 +416,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
-     * Move the Sony logical AF target and immediately trigger a short AF
-     * half-press. A7C II uses a 640x480 logical grid for D2DC.
+     * Move the Sony logical AF target. Camera Remote Command exposes AF Area
+     * Position (0xD2DC) as a standalone control; moving the target must not
+     * implicitly press the shutter. A7C II uses a 640x480 logical grid.
      */
     fun setAfPoint(x: Int, y: Int): String = commandAfPoint("AF TARGET", x, y)
 
@@ -428,18 +429,10 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val safeX = x.coerceIn(0, 639)
         val safeY = y.coerceIn(0, 479)
         val setResult = setAfAreaPosition(safeX, safeY)
-        Thread.sleep(120)
-        val pressResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 2)
-        Thread.sleep(450)
-        val releaseResult = setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, 1)
         return buildString {
             append(label).append(" x=").append(safeX).append(" y=").append(safeY)
             append(" | D2DC/9207=")
             append(PtpConstants.responseCodeName(setResult.responseCode))
-            append(" | halfPress=")
-            append(PtpConstants.responseCodeName(pressResult.responseCode))
-            append(" | release=")
-            append(PtpConstants.responseCodeName(releaseResult.responseCode))
         }
     }
 
