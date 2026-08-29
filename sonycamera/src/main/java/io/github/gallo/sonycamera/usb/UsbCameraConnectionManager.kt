@@ -514,34 +514,50 @@ class UsbCameraConnectionManager(
                 ?: return@withLock CameraOperationResult.Failure("Camera not connected")
             val safeX = x.coerceIn(0, 639)
             val safeY = y.coerceIn(0, 479)
-
-            // A new tap supersedes the pending release from the previous tap.
-            // If that AF press is still held, release it first so the new point
-            // receives a genuine new focus trigger rather than merely moving a
-            // target under an old half-press.
-            afReleaseJob?.cancel()
-            afReleaseJob = null
-            afGeneration += 1L
-            val generation = afGeneration
-
             val epoch = beginControlWrite()
             try {
                 val started = System.currentTimeMillis()
+
+                // Match Sony Camera Remote SDK / monitor-style touch control:
+                // one D2E4 RemoteTouchOperation performs the touch action at x/y.
+                // Do NOT decompose a normal a7C II tap into D2DC + shutter S1;
+                // that doubles PTP round trips and is observably less responsive.
+                if (camera.supportsRemoteTouch()) {
+                    val touch = camera.executeRemoteTouch(safeX, safeY)
+                    if (camera.supportsRemoteTouch()) {
+                        val elapsed = System.currentTimeMillis() - started
+                        val message = "REMOTE TOUCH x=$safeX y=$safeY | D2E4/9207=" +
+                            PtpConstants.responseCodeName(touch.responseCode) + " | ${elapsed}ms"
+                        Log.d(TAG, message)
+                        _events.emit(CameraEvent.FocusDebug(message))
+                        _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                        // A late/missing ACK is not grounds for a second AF action:
+                        // Sony controls take effect when the data phase lands. Only
+                        // an explicit Unsupported response disables this path.
+                        return@withLock CameraOperationResult.SuccessWithData(message)
+                    }
+                    Log.w(TAG, "Remote Touch unsupported by body; using legacy AF fallback")
+                }
+
+                // Compatibility fallback for bodies without Remote Touch.
+                // Keep the previous move + S1 behavior isolated here; a7C II
+                // should never use it unless the camera explicitly rejects D2E4.
+                afReleaseJob?.cancel()
+                afReleaseJob = null
+                afGeneration += 1L
+                val generation = afGeneration
                 if (afHalfPressHeld) {
                     camera.setAutofocusPressed(false)
                     afHalfPressHeld = false
                 }
-
                 val moveMessage = camera.setAfPoint(safeX, safeY)
                 val pressResult = camera.setAutofocusPressed(true)
                 afHalfPressHeld = true
                 val message = "$moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)}"
-                Log.d(TAG, "AF point+press completed in ${System.currentTimeMillis() - started}ms")
+                Log.d(TAG, "Legacy AF point+press completed in ${System.currentTimeMillis() - started}ms")
                 _events.emit(CameraEvent.FocusDebug(message))
                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
 
-                // Keep half-press long enough for AF to run, but release it in a
-                // separate job so the tap command itself returns immediately.
                 afReleaseJob = scope.launch(Dispatchers.IO) {
                     delay(320)
                     controlWriteMutex.withLock {

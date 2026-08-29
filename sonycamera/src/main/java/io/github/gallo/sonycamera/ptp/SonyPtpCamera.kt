@@ -72,6 +72,12 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     @Volatile
     private var sonyExtensionDebug: String = "ext=not-initialized"
 
+    // ILCE-7CM2 is a protocol-3 body supported by Sony Camera Remote SDK's
+    // Remote Touch Operation. Keep this capability session-scoped so an
+    // explicit Unsupported response can permanently fall back to legacy D2DC.
+    @Volatile
+    private var remoteTouchSupported = false
+
     @Volatile
     private var loggedLiveViewDataset = false
 
@@ -227,6 +233,16 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         Log.d(TAG, "GetExtDeviceInfo protocol=$selectedProtocol: " +
                 "${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
         if (!extInfo.isSuccess || extInfo.dataSize == 0) return false
+
+        // Sony's SDK exposes RemoteTouchOperation (wire control D2E4) on the
+        // a7C II generation. It is the official one-shot "touch the monitor"
+        // action; do not emulate that action as D2DC followed by a shutter S1.
+        // The PTP3 capability blob differs between generations, so the known
+        // ILCE-7CM2 model is the authority here rather than a brittle byte scan.
+        remoteTouchSupported = preferProtocol3
+        if (remoteTouchSupported) {
+            Log.d(TAG, "Remote Touch Operation enabled for ILCE-7CM2 (D2E4/9207)")
+        }
 
         // libgphoto2 / Sony PC-Remote traces complete SDIOConnect phase 3
         // before asserting PriorityMode. Restrict it to the newer body path so
@@ -410,6 +426,41 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         Log.d(TAG, "Capture commands sent (af=${PtpConstants.responseCodeName(afResult.responseCode)}, " +
                 "shutter=${PtpConstants.responseCodeName(captureResult.responseCode)})")
         return success
+    }
+
+    /** Whether this session should use Sony's official Remote Touch action. */
+    fun supportsRemoteTouch(): Boolean = remoteTouchSupported
+
+    /**
+     * Execute Sony Camera Remote SDK's Remote Touch Operation (D2E4).
+     *
+     * The SDK defines this control as UInt32 with x in the upper 16 bits and y
+     * in the lower 16 bits, on a 640x480 logical monitor. Function-of-Remote-
+     * Touch is a separate camera property (Tracking AF / Spot AF / AF Area
+     * Select); sending the touch itself is a single SetControlDeviceB action.
+     */
+    fun executeRemoteTouch(x: Int, y: Int): PtpResponse {
+        val safeX = x.coerceIn(0, 639)
+        val safeY = y.coerceIn(0, 479)
+        val packed = (safeX shl 16) or safeY
+        val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(packed)
+            .array()
+        val result = transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
+            data,
+            PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION
+        )
+        if (result.responseCode == PtpConstants.RESP_OPERATION_NOT_SUPPORTED ||
+            result.responseCode == PtpConstants.RESP_PARAMETER_NOT_SUPPORTED
+        ) {
+            remoteTouchSupported = false
+            Log.w(TAG, "Remote Touch explicitly unsupported; falling back to D2DC/S1")
+        } else {
+            Log.d(TAG, "Remote Touch: x=$safeX y=$safeY packed=0x${packed.toUInt().toString(16)} " +
+                    "-> ${PtpConstants.responseCodeName(result.responseCode)}")
+        }
+        return result
     }
 
     /**

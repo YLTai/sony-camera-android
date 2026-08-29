@@ -72,6 +72,13 @@ object PtpConstants {
     const val PROP_SONY_FOCUS_MODE = 0xD208
     const val PROP_SONY_FOCUS_AREA = 0xD22C
     const val PROP_SONY_AF_AREA_POSITION = 0xD2DC
+    // Sony Camera Remote SDK "Remote Touch Operation": execute a touch at
+    // x/y in the same 640x480 logical coordinate system used by AF area position.
+    // Unlike D2DC this is a momentary control action and can perform Spot AF in
+    // one control transaction, matching the SDK's touch-monitoring path.
+    const val PROP_SONY_REMOTE_TOUCH_OPERATION = 0xD2E4
+    const val PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS = 0xD284
+    const val PROP_SONY_REMOTE_TOUCH_FUNCTION = 0xE083
     const val PROP_SONY_LIVEVIEW_STATE = 0xD221
     const val PROP_SONY_STILL_IMAGE_STORE_DEST = 0xD222
     const val PROP_SONY_PHOTO_TRANSFER_QUEUE = 0xD215
