@@ -45,6 +45,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 /**
  * USB PTP camera connection engine for Sony cameras.
@@ -132,7 +133,129 @@ class UsbCameraConnectionManager(
     private val priorityControlIntents = AtomicInteger(0)
     @Volatile private var afHalfPressHeld = false
     private var afReleaseJob: Job? = null
+    private var afTriggerJob: Job? = null
     private var afGeneration = 0L
+
+    private data class PendingAfFrameLatency(
+        val generation: Long,
+        val x: Int,
+        val y: Int,
+        val requestedAtMs: Long,
+        val ackAtMs: Long
+    )
+
+    private val afStateLock = Any()
+    @Volatile private var pendingAfFrameLatency: PendingAfFrameLatency? = null
+
+    private fun focusFramesContainTarget(info: CameraFocusFrameInfo, x: Int, y: Int): Boolean {
+        if (info.frames.isEmpty()) return false
+        val targetX = x / 639f
+        val targetY = y / 479f
+        return info.frames.any { frame ->
+            val toleranceX = maxOf(0.025f, frame.widthNormalized * 0.75f)
+            val toleranceY = maxOf(0.030f, frame.heightNormalized * 0.75f)
+            abs(frame.centerXNormalized - targetX) <= toleranceX &&
+                abs(frame.centerYNormalized - targetY) <= toleranceY
+        }
+    }
+
+    private fun observeAfFrameLatency(info: CameraFocusFrameInfo) {
+        val pending = synchronized(afStateLock) { pendingAfFrameLatency } ?: return
+        val now = System.currentTimeMillis()
+        val matched = focusFramesContainTarget(info, pending.x, pending.y)
+        val elapsed = now - pending.requestedAtMs
+        if (!matched && elapsed < 1_500L) return
+
+        val claimed = synchronized(afStateLock) {
+            val current = pendingAfFrameLatency
+            if (current?.generation != pending.generation) {
+                false
+            } else {
+                pendingAfFrameLatency = null
+                true
+            }
+        }
+        if (!claimed) return
+
+        val ackMs = pending.ackAtMs - pending.requestedAtMs
+        if (matched) {
+            val frameMs = now - pending.requestedAtMs
+            val afterAckMs = now - pending.ackAtMs
+            _events.tryEmit(
+                CameraEvent.FocusDebug(
+                    "AF CAMERA FRAME | x=${pending.x} y=${pending.y} | " +
+                        "ack=${ackMs}ms frame=${frameMs}ms afterAck=${afterAckMs}ms"
+                )
+            )
+        } else {
+            _events.tryEmit(
+                CameraEvent.FocusDebug(
+                    "AF CAMERA FRAME | x=${pending.x} y=${pending.y} | " +
+                        "ack=${ackMs}ms frame=>1500ms (target not returned)"
+                )
+            )
+        }
+    }
+
+    private fun scheduleAutofocusAfterAreaMove(camera: SonyPtpCamera, generation: Long) {
+        afTriggerJob?.cancel()
+        afTriggerJob = scope.launch(Dispatchers.IO) {
+            // Give the camera roughly one Live View frame to publish the moved
+            // focus area before S1 starts lens AF. This keeps point movement and
+            // autofocus as two distinct Sony operations instead of conflating them.
+            delay(90)
+            if (generation != afGeneration || ptpCamera !== camera) return@launch
+
+            priorityControlIntents.incrementAndGet()
+            var pressed = false
+            try {
+                controlWriteMutex.withLock {
+                    if (generation != afGeneration || ptpCamera !== camera) return@withLock
+                    val epoch = beginControlWrite()
+                    try {
+                        if (afHalfPressHeld) {
+                            camera.setAutofocusPressed(false)
+                            afHalfPressHeld = false
+                        }
+                        val press = camera.setAutofocusPressed(true)
+                        pressed = press.isSuccess
+                        afHalfPressHeld = pressed
+                        Log.d(TAG, "Deferred AF S1 generation=$generation: " +
+                            PtpConstants.responseCodeName(press.responseCode))
+                    } finally {
+                        endControlWrite(epoch)
+                    }
+                }
+            } finally {
+                priorityControlIntents.decrementAndGet()
+            }
+
+            if (!pressed) return@launch
+            afReleaseJob?.cancel()
+            afReleaseJob = scope.launch(Dispatchers.IO) {
+                delay(280)
+                priorityControlIntents.incrementAndGet()
+                try {
+                    controlWriteMutex.withLock {
+                        if (generation != afGeneration || ptpCamera !== camera || !afHalfPressHeld) {
+                            return@withLock
+                        }
+                        val releaseEpoch = beginControlWrite()
+                        try {
+                            camera.setAutofocusPressed(false)
+                            afHalfPressHeld = false
+                        } catch (e: Exception) {
+                            Log.w(TAG, "AF half-press release failed: ${e.message}")
+                        } finally {
+                            endControlWrite(releaseEpoch)
+                        }
+                    }
+                } finally {
+                    priorityControlIntents.decrementAndGet()
+                }
+            }
+        }
+    }
 
     private fun beginControlWrite(): Long = synchronized(controlEpochLock) {
         controlEpoch += 1L
@@ -391,6 +514,7 @@ class UsbCameraConnectionManager(
                                     )
                                 }
                             )
+                            observeAfFrameLatency(cameraInfo)
                             if (cameraInfo != lastFocusFrameInfo) {
                                 lastFocusFrameInfo = cameraInfo
                                 _events.emit(CameraEvent.FocusFramesUpdated(cameraInfo))
@@ -517,9 +641,9 @@ class UsbCameraConnectionManager(
     }
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
-        // Publish the intent on the caller's thread BEFORE hopping to Dispatchers.IO
-        // or waiting for controlWriteMutex. This closes the race where Live View
-        // checked controlWriteActive=false and queued another GetObject first.
+        // "total" on the old Remote Touch path only measured command ACK. For
+        // point-movement UX that is the wrong metric: the user sees the first
+        // Live View FocalFrameInfo carrying the new geometry. Record both.
         val requestedAtMs = System.currentTimeMillis()
         priorityControlIntents.incrementAndGet()
         return try {
@@ -537,67 +661,53 @@ class UsbCameraConnectionManager(
                         val prepDebug = camera.prepareMonitorTapAf()
                         val prepMs = System.currentTimeMillis() - prepStartedMs
 
-                        // ILCE-7CM2 monitor taps use Remote Touch only when the
-                        // camera itself reports D284=Enable and E083=Spot AF.
-                        // The transport call is explicitly high-priority; Live View
-                        // never queues in front of it and drops a frame if PTP is busy.
-                        if (camera.supportsRemoteTouch()) {
-                            val touch = camera.executeRemoteTouch(safeX, safeY)
-                            if (camera.supportsRemoteTouch()) {
-                                val finishedMs = System.currentTimeMillis()
-                                val commandMs = finishedMs - commandStartedMs
-                                val wireAndAckMs = (commandMs - touch.queueWaitMs).coerceAtLeast(0L)
-                                val totalMs = finishedMs - requestedAtMs
-                                val message = "AF RT SPOT | $prepDebug | x=$safeX y=$safeY | " +
-                                    "D2E4=${PtpConstants.responseCodeName(touch.responseCode)} | " +
-                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms " +
-                                    "wire+ack=${wireAndAckMs}ms total=${totalMs}ms"
-                                Log.d(TAG, message)
-                                _events.emit(CameraEvent.FocusDebug(message))
-                                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-                                return@withLock CameraOperationResult.SuccessWithData(message)
-                            }
-                            Log.w(TAG, "Remote Touch unsupported by body; using legacy AF fallback")
-                        }
-
-                        // Compatibility fallback for bodies without Remote Touch.
+                        afTriggerJob?.cancel()
                         afReleaseJob?.cancel()
-                        afReleaseJob = null
                         afGeneration += 1L
                         val generation = afGeneration
+
+                        // A stale S1 from the previous tap can keep the camera in an
+                        // active focusing state. Release it before moving the next area.
                         if (afHalfPressHeld) {
                             camera.setAutofocusPressed(false)
                             afHalfPressHeld = false
                         }
-                        val moveMessage = camera.setAfPoint(safeX, safeY)
-                        // Surface the actual move as soon as D2DC completes; S1 focus
-                        // follows, but no UI/logcat access is required to see the path.
-                        _events.emit(CameraEvent.FocusDebug("$prepDebug | $moveMessage | AF starting"))
-                        val pressResult = camera.setAutofocusPressed(true)
-                        afHalfPressHeld = true
-                        val totalMs = System.currentTimeMillis() - requestedAtMs
-                        val message = "$prepDebug | $moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)} | total=${totalMs}ms"
-                        Log.d(TAG, "Legacy AF point+press completed in ${System.currentTimeMillis() - commandStartedMs}ms")
+
+                        val moveStartedMs = System.currentTimeMillis()
+                        val move = camera.moveAfAreaPosition(safeX, safeY)
+                        val ackAtMs = System.currentTimeMillis()
+                        val wireAndAckMs = (ackAtMs - moveStartedMs - move.queueWaitMs).coerceAtLeast(0L)
+                        val ackMs = ackAtMs - requestedAtMs
+
+                        if (!move.isSuccess) {
+                            synchronized(afStateLock) { pendingAfFrameLatency = null }
+                            val message = "AF MOVE | $prepDebug | x=$safeX y=$safeY | " +
+                                "D2DC=${PtpConstants.responseCodeName(move.responseCode)} | ack=${ackMs}ms"
+                            _events.emit(CameraEvent.FocusDebug(message))
+                            return@withLock CameraOperationResult.Failure(message)
+                        }
+
+                        synchronized(afStateLock) {
+                            pendingAfFrameLatency = PendingAfFrameLatency(
+                                generation = generation,
+                                x = safeX,
+                                y = safeY,
+                                requestedAtMs = requestedAtMs,
+                                ackAtMs = ackAtMs
+                            )
+                        }
+
+                        val message = "AF MOVE | $prepDebug | x=$safeX y=$safeY | D2DC=OK | " +
+                            "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${move.queueWaitMs}ms " +
+                            "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms | waiting FRAME"
+                        Log.d(TAG, message)
                         _events.emit(CameraEvent.FocusDebug(message))
                         _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
 
-                        afReleaseJob = scope.launch(Dispatchers.IO) {
-                            delay(320)
-                            controlWriteMutex.withLock {
-                                if (generation != afGeneration || ptpCamera !== camera || !afHalfPressHeld) {
-                                    return@withLock
-                                }
-                                val releaseEpoch = beginControlWrite()
-                                try {
-                                    camera.setAutofocusPressed(false)
-                                    afHalfPressHeld = false
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "AF half-press release failed: ${e.message}")
-                                } finally {
-                                    endControlWrite(releaseEpoch)
-                                }
-                            }
-                        }
+                        // AF is deliberately a second operation. The 90ms gap lets
+                        // the moved Spot-S frame reach Live View first on responsive
+                        // bodies while still starting autofocus promptly.
+                        scheduleAutofocusAfterAreaMove(camera, generation)
                         CameraOperationResult.SuccessWithData(message)
                     } catch (e: Exception) {
                         Log.e(TAG, "AF target command failed", e)
@@ -677,6 +787,9 @@ class UsbCameraConnectionManager(
             try {
                 val result = camera.setCameraSettingValue(setting, rawValue)
                 _events.emit(CameraEvent.CameraSettingsUpdated(result.state))
+                if (result.success && setting == CameraSetting.FOCUS_AREA) {
+                    camera.invalidateMonitorTapAf()
+                }
                 if (result.success) CameraOperationResult.Success
                 else CameraOperationResult.Failure(result.message ?: "Camera setting change failed")
             } finally {
@@ -860,9 +973,12 @@ class UsbCameraConnectionManager(
         isLiveviewActive = false
         liveviewJob?.cancel()
         liveviewJob = null
+        afTriggerJob?.cancel()
+        afTriggerJob = null
         afReleaseJob?.cancel()
         afReleaseJob = null
         afHalfPressHeld = false
+        synchronized(afStateLock) { pendingAfFrameLatency = null }
         controlWriteActive = false
         priorityControlIntents.set(0)
 

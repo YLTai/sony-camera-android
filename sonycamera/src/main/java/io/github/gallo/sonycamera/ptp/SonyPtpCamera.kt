@@ -541,53 +541,27 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         )
         if (!snapshot.isSuccess || snapshot.data.isEmpty()) {
             remoteTouchSupported = false
+            monitorAfPrepared = false
             monitorAfDebugState = "AF prep 9209=${PtpConstants.responseCodeName(snapshot.responseCode)}"
             return monitorAfDebugState
         }
 
         var data = snapshot.data
-        var enable = findSonyScalarEnumProperty(
+        val enable = findSonyScalarEnumProperty(
             data, PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS, 0x0002
         )
-        var function = findSonyScalarEnumProperty(
+        val function = findSonyScalarEnumProperty(
             data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
         )
-        var functionWrite: PtpResponse? = null
-
-        // Sony SDK: FunctionOfRemoteTouchOperation 2 == Spot AF.
-        if (function != null && function.currentValue != 2L && function.writable &&
-            (function.enumValues.isEmpty() || 2L in function.enumValues)
-        ) {
-            functionWrite = setSonyScalarProperty(function, 2L)
-            if (functionWrite.isSuccess) {
-                val verify = transport.sendCommandWithDataShortTimeout(
-                    PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-                    500
-                )
-                if (verify.isSuccess && verify.data.isNotEmpty()) {
-                    data = verify.data
-                    enable = findSonyScalarEnumProperty(
-                        data, PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS, 0x0002
-                    )
-                    function = findSonyScalarEnumProperty(
-                        data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
-                    )
-                }
-            }
-        }
-
         val enableRaw = enable?.currentValue
         val functionRaw = function?.currentValue
         remoteTouchSupported = enableRaw == 1L && functionRaw == 2L
-        if (remoteTouchSupported) {
-            monitorAfPrepared = true
-            monitorAfDebugState = "RT SPOT ready en=1 func=2"
-            return monitorAfDebugState
-        }
 
-        // Official RemoteSampleApp's AF Area Position path automatically selects
-        // Flexible Spot S before accepting an x/y coordinate. For ILCE-7CM2 the
-        // camera-reported focus-area table uses raw 5 for Spot S.
+        // For monitor point movement use the same AF Area Position semantics as
+        // Sony's RemoteSampleApp: Flexible/Spot S first, then the XY update.
+        // Do not mutate FunctionOfRemoteTouchOperation here; D2E4 is a remote
+        // touch ACTION and its fast ACK is not proof that the focus-area frame
+        // has moved on the camera.
         var focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
         var spotWrite: PtpResponse? = null
         if (focusArea != null && focusArea.currentValue != 5L) {
@@ -605,20 +579,24 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
 
         val spotReady = focusArea?.currentValue == 5L || spotWrite?.isSuccess == true
-        monitorAfPrepared = true
+        monitorAfPrepared = spotReady
         monitorAfDebugState = buildString {
-            append("AF AREA SpotS fallback")
+            append("AF AREA SpotS ").append(if (spotReady) "ready" else "NOT READY")
             append(" rtEn=").append(enableRaw ?: -1)
             append(" func=").append(functionRaw ?: -1)
-            if (functionWrite != null) {
-                append(" fset=").append(PtpConstants.responseCodeName(functionWrite.responseCode))
-            }
-            append(" spot=").append(if (spotReady) 1 else 0)
+            append(" area=").append(focusArea?.currentValue ?: -1)
             if (spotWrite != null) {
                 append(" sset=").append(PtpConstants.responseCodeName(spotWrite.responseCode))
             }
         }
         return monitorAfDebugState
+    }
+
+    @Synchronized
+    fun invalidateMonitorTapAf() {
+        monitorAfPrepared = false
+        remoteTouchSupported = false
+        monitorAfDebugState = "AF path invalidated"
     }
 
     fun monitorAfDebug(): String = monitorAfDebugState
@@ -679,6 +657,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 "-> ${PtpConstants.responseCodeName(result.responseCode)}")
         return result
     }
+
+    /** High-priority AF-area move used by monitor taps. */
+    fun moveAfAreaPosition(x: Int, y: Int): PtpResponse = setAfAreaPosition(x, y)
 
     /** Move the Sony logical AF target on the a7C II 640x480 logical grid. */
     fun setAfPoint(x: Int, y: Int): String = commandAfPoint("AF TARGET", x, y)
