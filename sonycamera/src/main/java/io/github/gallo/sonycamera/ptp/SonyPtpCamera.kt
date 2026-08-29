@@ -1249,15 +1249,17 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             options.firstOrNull { it.rawValue == raw }
                 ?: CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
         }
-        // Aperture limits are lens-specific. Prefer explicit descriptor range
-        // bounds; enum-only lenses still provide authoritative first/last F values.
+        // Aperture limits must come from the camera/lens descriptor itself.
+        // Never derive MIN/MAX from the generic compatibility choice table: if
+        // Sony does not report a range or enum, leave the bound unknown in UI.
+        val authoritativeApertureValues = descriptor.enumValues.distinct()
         val minimum = if (descriptor.setting == CameraExposureSetting.APERTURE) {
-            (descriptor.rangeMin ?: raws.minOrNull())?.let { raw ->
+            (descriptor.rangeMin ?: authoritativeApertureValues.minOrNull())?.let { raw ->
                 CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
             }
         } else null
         val maximum = if (descriptor.setting == CameraExposureSetting.APERTURE) {
-            (descriptor.rangeMax ?: raws.maxOrNull())?.let { raw ->
+            (descriptor.rangeMax ?: authoritativeApertureValues.maxOrNull())?.let { raw ->
                 CameraExposureOption(raw, formatExposureValue(descriptor.setting, raw))
             }
         } else null
