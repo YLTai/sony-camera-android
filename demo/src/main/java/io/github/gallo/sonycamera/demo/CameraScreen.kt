@@ -890,8 +890,8 @@ private data class SelectorOption(val rawValue: Long, val label: String)
 
 /**
  * Sony-style virtual control dial for ordered settings. Drag left/right to turn
- * through camera-reported steps; only the final detent is sent over USB so a
- * fast finger movement never queues dozens of PTP writes behind live view.
+ * continuously through camera-reported steps. While dragging, the newest detent
+ * is sampled and sent at a bounded rate so live-view adjustments stay observable.
  */
 @Composable
 private fun DialSelectorPanel(
@@ -932,7 +932,10 @@ private fun DialSelectorPanel(
         while (true) {
             delay(150)
             val target = liveTargetRaw ?: continue
-            if (target != lastStreamedRaw && target != latestCurrentRaw.value) {
+            // Compare against what we last commanded, not the latest camera
+            // snapshot. That snapshot may still describe the pre-drag value; if
+            // the user drags away and back, the return command must still be sent.
+            if (target != lastStreamedRaw) {
                 lastStreamedRaw = target
                 pendingRaw = target
                 latestOnSelect.value(target)
@@ -944,7 +947,8 @@ private fun DialSelectorPanel(
     // eventually return to the authoritative camera state. Stale poll results
     // are still ignored while pending, so an old snapshot cannot pull the dial
     // backwards immediately after the user's gesture.
-    LaunchedEffect(pendingRaw) {
+    LaunchedEffect(pendingRaw, dragging) {
+        if (dragging) return@LaunchedEffect
         val pending = pendingRaw ?: return@LaunchedEffect
         delay(3_000)
         if (pendingRaw == pending && latestCurrentRaw.value != pending) {
@@ -1021,14 +1025,10 @@ private fun DialSelectorPanel(
                                     dialPosition = finalIndex.toFloat()
                                     dragging = false
                                     liveTargetRaw = null
-                                    if (finalRaw != latestCurrentRaw.value) {
-                                        pendingRaw = finalRaw
-                                        if (finalRaw != lastStreamedRaw) {
-                                            lastStreamedRaw = finalRaw
-                                            latestOnSelect.value(finalRaw)
-                                        }
-                                    } else {
-                                        pendingRaw = null
+                                    pendingRaw = if (finalRaw == latestCurrentRaw.value) null else finalRaw
+                                    if (finalRaw != lastStreamedRaw) {
+                                        lastStreamedRaw = finalRaw
+                                        latestOnSelect.value(finalRaw)
                                     }
                                 },
                                 onDragCancel = {
