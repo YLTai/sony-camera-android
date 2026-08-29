@@ -1089,7 +1089,13 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     /** Read aperture, shutter and ISO with one 0x9209 round trip. */
     fun readExposureState(forceDescriptorProbe: Boolean = false): CameraExposureState {
         ensureExposureDescriptors(forceDescriptorProbe)
-        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        // Telemetry is low priority. Bound a busy-camera read so it cannot sit
+        // on the shared PTP transport for the global 5-second timeout while a
+        // user is waiting to move AF or turn an exposure dial.
+        val all = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+            700
+        )
         val allData = if (all.isSuccess) all.data else ByteArray(0)
 
         // Refresh descriptor forms from the live 0x9209 snapshot. This matters for
@@ -1117,8 +1123,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             } else null
             if (fromAll != null) return fromAll
 
-            val direct = transport.sendCommandWithData(
+            val direct = transport.sendCommandWithDataShortTimeout(
                 PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
+                500,
                 descriptor.propertyCode
             )
             if (!direct.isSuccess || direct.data.isEmpty()) return descriptor.initialValue
