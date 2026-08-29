@@ -295,8 +295,12 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      * Older protocol-2 bodies fall back to the historical JPEG-SOI scan.
      */
     fun getLiveViewFrameData(): SonyLiveViewFrame? {
-        val response = transport.sendCommandWithData(
+        // Live view is a continuous low-priority producer. Never allow one
+        // busy frame request to hold the shared PTP transport for the global
+        // 5-second timeout while the user is waiting on AF/exposure control.
+        val response = transport.sendCommandWithDataShortTimeout(
             PtpConstants.OP_GET_OBJECT,
+            450,
             PtpConstants.LIVEVIEW_OBJECT_HANDLE
         )
 
@@ -1094,7 +1098,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // user is waiting to move AF or turn an exposure dial.
         val all = transport.sendCommandWithDataShortTimeout(
             PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            700
+            500
         )
         val allData = if (all.isSuccess) all.data else ByteArray(0)
 
@@ -1125,7 +1129,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
             val direct = transport.sendCommandWithDataShortTimeout(
                 PtpConstants.OP_SONY_GET_DEVICE_PROP_VALUE,
-                500,
+                350,
                 descriptor.propertyCode
             )
             if (!direct.isSuccess || direct.data.isEmpty()) return descriptor.initialValue
@@ -1498,7 +1502,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     fun readCameraSettingsState(): CameraSettingsState {
         val response = transport.sendCommandWithDataShortTimeout(
             PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            900
+            500
         )
         val data = if (response.isSuccess) response.data else ByteArray(0)
 
