@@ -104,12 +104,13 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             return true
         }
 
-        // SessionAlreadyOpen: try the standard CloseSession once, then reopen.
-        // If that does not work, the manager will perform one class Device Reset.
+        // SessionAlreadyOpen usually means a previous PC-Remote owner survived.
+        // Release Sony priority too; a plain CloseSession can leave the remote
+        // ownership state that makes the next host look connected but deny liveview.
         if (response.responseCode == 0x201E) {
-            Log.w(TAG, "PTP session already open — closing stale session once")
-            closeSession()
-            Thread.sleep(120)
+            Log.w(TAG, "PTP session already open — releasing stale Sony remote ownership")
+            endSession()
+            Thread.sleep(250)
             transport.resetTransactionId()
             response = transport.sendCommand(
                 PtpConstants.OP_OPEN_SESSION,
@@ -195,6 +196,10 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         } else null
 
         val useProtocol3 = extV3?.isSuccess == true && extV3.dataSize > 0
+        if (preferProtocol3 && !useProtocol3) {
+            Log.e(TAG, "a7C II protocol-3 device-info request failed; refusing protocol-2 fallback")
+            return false
+        }
         val extInfo = if (useProtocol3) {
             extV3!!
         } else {
@@ -223,13 +228,6 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             Thread.sleep(150)
         }
 
-        // Property snapshot is useful for diagnostics but is not required to
-        // decide whether the transport-level Sony handshake succeeded.
-        val props = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA, 2500
-        )
-        Log.d(TAG, "GetAllDevicePropData: ${PtpConstants.responseCodeName(props.responseCode)}, ${props.dataSize}B")
-
         sonyExtensionDebug = buildString {
             append("ext=").append(selectedProtocol)
             if (preferProtocol3) {
@@ -242,15 +240,14 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             append(" extInfo=")
             append(PtpConstants.responseCodeName(extInfo.responseCode))
             append("/").append(extInfo.dataSize).append("B")
-            append(" init9209=")
-            append(PtpConstants.responseCodeName(props.responseCode))
-            append("/").append(props.dataSize).append("B")
         }
 
-        // Tell camera that USB host has control. Some Sony commands acknowledge
-        // slowly/silently, so keep this best-effort after the mandatory SDIO
-        // stages rather than treating a quick-response timeout as disconnect.
-        setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
+        // Acquire host control immediately after phase 3. The response can be late
+        // on Sony bodies, so the manager uses a successful live-view fetch as the
+        // authoritative readiness check instead of trusting this ACK alone.
+        val priority = setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
+        Log.d(TAG, "PriorityMode=1: ${PtpConstants.responseCodeName(priority.responseCode)}")
+        if (preferProtocol3) Thread.sleep(250)
         return true
     }
 

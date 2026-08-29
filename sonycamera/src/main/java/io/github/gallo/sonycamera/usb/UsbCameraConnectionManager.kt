@@ -67,8 +67,10 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
-        private const val EXPOSURE_POLL_INTERVAL_MS = 120L
-        private const val SETTINGS_POLL_INTERVAL_MS = 250L
+        private const val EXPOSURE_POLL_INTERVAL_MS = 900L
+        private const val SETTINGS_POLL_INTERVAL_MS = 3_000L
+        private const val TELEMETRY_WARMUP_MS = 2_000L
+        private const val FIRST_LIVEVIEW_PROBE_MS = 4_000L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -294,8 +296,8 @@ class UsbCameraConnectionManager(
             var frameCount = 0L
             var errorCount = 0L
             var lastLogTime = System.currentTimeMillis()
-            var lastExposurePollTime = 0L
-            var lastSettingsPollTime = 0L
+            var lastExposurePollTime = System.currentTimeMillis()
+            var lastSettingsPollTime = lastExposurePollTime
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
             var pipeRecoveryAttempts = 0
@@ -362,21 +364,22 @@ class UsbCameraConnectionManager(
                         postCaptureResumeDeadlineMs = 0L
                         lastFrameTime = System.currentTimeMillis()
 
-                        // Exposure values change relatively slowly. One Sony 0x9209 snapshot
-                        // supplies aperture, shutter and ISO without shrinking liveview throughput
-                        // with three independent property round trips.
-                        val exposurePollNow = System.currentTimeMillis()
-                        if (exposurePollNow - lastExposurePollTime >= EXPOSURE_POLL_INTERVAL_MS) {
-                            lastExposurePollTime = exposurePollNow
-                            ptpCamera?.readExposureState()?.let { exposure ->
-                                _events.emit(CameraEvent.ExposureUpdated(exposure))
-                            }
-                        }
-
-                        if (exposurePollNow - lastSettingsPollTime >= SETTINGS_POLL_INTERVAL_MS) {
-                            lastSettingsPollTime = exposurePollNow
-                            ptpCamera?.readCameraSettingsState()?.let { settings ->
-                                _events.emit(CameraEvent.CameraSettingsUpdated(settings))
+                        // The Sony USB transport is strictly serial. Do not perform property
+                        // snapshots immediately after the first frame, and never stack exposure +
+                        // settings reads in the same frame iteration. App-originated writes already
+                        // publish their result immediately; these polls are only for camera-side dials.
+                        val telemetryNow = System.currentTimeMillis()
+                        if (telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS) {
+                            if (telemetryNow - lastSettingsPollTime >= SETTINGS_POLL_INTERVAL_MS) {
+                                lastSettingsPollTime = telemetryNow
+                                ptpCamera?.readCameraSettingsState()?.let { settings ->
+                                    _events.emit(CameraEvent.CameraSettingsUpdated(settings))
+                                }
+                            } else if (telemetryNow - lastExposurePollTime >= EXPOSURE_POLL_INTERVAL_MS) {
+                                lastExposurePollTime = telemetryNow
+                                ptpCamera?.readExposureState()?.let { exposure ->
+                                    _events.emit(CameraEvent.ExposureUpdated(exposure))
+                                }
                             }
                         }
 
@@ -839,7 +842,7 @@ class UsbCameraConnectionManager(
             localIface = findPtpInterface(device)
             if (localIface == null) {
                 _connectionState.value = CameraConnectionState.Error(
-                    "Camera USB mode is wrong. In the camera menu, set USB Connection to 'PC Remote' or 'Auto'."
+                    "Camera USB mode is wrong. On a7C II set USB Connection Mode to 'Remote Shoot (PC Remote)' and USB LUN to 'Single'."
                 )
                 return@withContext
             }
@@ -891,7 +894,7 @@ class UsbCameraConnectionManager(
 
             if (bulkIn == null || bulkOut == null) {
                 _connectionState.value = CameraConnectionState.Error(
-                    "Camera USB mode is wrong. In the camera menu, set USB Connection to 'PC Remote' or 'Auto'."
+                    "Camera USB mode is wrong. On a7C II set USB Connection Mode to 'Remote Shoot (PC Remote)' and USB LUN to 'Single'."
                 )
                 return@withContext
             }
@@ -922,40 +925,56 @@ class UsbCameraConnectionManager(
                 Log.w(TAG, "Could not get device info, continuing with generic Sony identity")
             }
 
-            // Mandatory Sony vendor handshake. Never publish Ready after only
-            // part of SDIOConnect succeeded — that produces the long, doomed
-            // liveview wait users were seeing.
-            if (!localCamera.initSonyExtension()) {
+            // The vendor handshake alone is not enough to declare success on a7C II.
+            // A stale remote owner can accept SDIO commands yet deny 0xFFFFC002 forever.
+            // Verify the real live-view object first. If that fails, reproduce the useful
+            // part of a clean Monitor+ open/close cycle: release priority, CloseSession,
+            // then reopen and run the complete protocol-3 handshake exactly once.
+            var remoteReady = localCamera.initSonyExtension() && probeLiveViewReady(localCamera)
+            if (!remoteReady) {
+                Log.w(TAG, "Sony remote session not stream-ready — recycling PC Remote session once")
+                runCatching { localCamera.endSession() }
+                    .onFailure { Log.w(TAG, "Remote-session release failed: ${it.message}") }
+                runCatching { localCamera.flushAndResetPipe() }
+                delay(350)
+
+                localCamera = SonyPtpCamera(transport)
+                var reopened = localCamera.openSession()
+                if (!reopened) {
+                    Log.w(TAG, "Recycled OpenSession failed — using one class-reset recovery")
+                    transport.recoverAfterFailedOpenSession(localIface.id)
+                    localCamera = SonyPtpCamera(transport)
+                    reopened = localCamera.openSession()
+                }
+
+                if (reopened) {
+                    if (!localCamera.getDeviceInfo()) {
+                        Log.w(TAG, "Could not refresh device info after remote-session recycle")
+                    }
+                    remoteReady = localCamera.initSonyExtension() && probeLiveViewReady(localCamera)
+                }
+            }
+
+            if (!remoteReady) {
                 _connectionState.value = CameraConnectionState.Error(
-                    "Sony PC Remote initialization failed. Disconnect once and try again."
+                    "a7C II PC Remote session did not become stream-ready. Set USB Connection Mode to PC Remote, USB LUN to Single, and Network > PC Remote Function > PC Remote to Off, then reconnect."
                 )
                 return@withContext
             }
 
-            // Commit: take ownership of the resources.
+            // Commit only after a real live-view dataset has been observed. Property
+            // discovery is intentionally deferred until the stream has warmed up.
             usbDevice = device
             usbConnection = localConn
             ptpInterface = localIface
             ptpCamera = localCamera
             committed = true
 
-            _cameraName.value = localCamera.deviceName ?: "Sony Camera (USB)"
+            _cameraName.value = localCamera.deviceName ?: "Sony a7C II (USB)"
+            Log.d(TAG, "USB camera stream-ready: ${localCamera.deviceName}")
             _connectionState.value = CameraConnectionState.Ready
 
-            // Discover exposure controls before liveview begins, then seed the
-            // monitor top bar with the exact current values and choices.
-            _events.emit(CameraEvent.ExposureUpdated(localCamera.readExposureState(forceDescriptorProbe = true)))
-
-            Log.d(TAG, "USB camera connected: ${localCamera.deviceName}")
-
-            // Do not touch the shutter during connection. A half-press here
-            // adds another vendor-control transaction exactly when the camera has
-            // just entered PC Remote and can destabilize first-liveview startup.
-
-            // Auto-start liveview — camera is already in PC Remote mode
-            // Auto-start liveview — camera is already in PC Remote mode
-            // with liveview active after SDIO init
-            Log.d(TAG, "Auto-starting USB liveview...")
+            Log.d(TAG, "Auto-starting verified USB liveview...")
             startLiveview()
         } catch (cancel: kotlinx.coroutines.CancellationException) {
             // Caller (disconnect / detach) is tearing us down. Don't flip to Error —
@@ -980,36 +999,64 @@ class UsbCameraConnectionManager(
         }
     }
 
-    private fun hasPtpInterface(device: UsbDevice): Boolean {
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            // PTP/MTP uses class 6 (Still Image), but some devices use class 255 (vendor-specific)
-            if (iface.interfaceClass == PtpConstants.USB_CLASS_PTP ||
-                iface.interfaceClass == 255) return true
+    private suspend fun probeLiveViewReady(camera: SonyPtpCamera): Boolean {
+        val started = System.currentTimeMillis()
+        var pipeCleared = false
+        var attempts = 0
+        while (System.currentTimeMillis() - started < FIRST_LIVEVIEW_PROBE_MS) {
+            attempts++
+            val frame = camera.getLiveViewFrameData()
+            if (frame?.jpeg?.isNotEmpty() == true) {
+                Log.d(TAG, "First liveview verified after $attempts attempts / ${System.currentTimeMillis() - started}ms")
+                return true
+            }
+            if (!pipeCleared && System.currentTimeMillis() - started >= 1_200L) {
+                Log.w(TAG, "First liveview still denied — clearing endpoints once")
+                camera.flushAndResetPipe()
+                pipeCleared = true
+            }
+            delay(80)
+        }
+        Log.w(TAG, "First liveview verification failed after $attempts attempts")
+        return false
+    }
+
+    private fun hasPtpInterface(device: UsbDevice): Boolean = findPtpInterface(device) != null
+
+    private fun interfaceHasBulkPair(iface: UsbInterface): Boolean {
+        var bulkIn = false
+        var bulkOut = false
+        for (e in 0 until iface.endpointCount) {
+            val ep = iface.getEndpoint(e)
+            if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+            if (ep.direction == UsbConstants.USB_DIR_IN) bulkIn = true
+            if (ep.direction == UsbConstants.USB_DIR_OUT) bulkOut = true
+        }
+        return bulkIn && bulkOut
+    }
+
+    private fun interfaceHasInterruptIn(iface: UsbInterface): Boolean {
+        for (e in 0 until iface.endpointCount) {
+            val ep = iface.getEndpoint(e)
+            if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT &&
+                ep.direction == UsbConstants.USB_DIR_IN) return true
         }
         return false
     }
 
     private fun findPtpInterface(device: UsbDevice): UsbInterface? {
-        // Prefer class 6 (standard PTP/MTP)
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == PtpConstants.USB_CLASS_PTP) return iface
+        val interfaces = (0 until device.interfaceCount).map { device.getInterface(it) }
+
+        // A real PTP control interface needs both bulk directions. Prefer the one
+        // that also exposes the interrupt event endpoint; this avoids depending on
+        // Android's interface enumeration order when the camera exposes multiple LUNs.
+        return interfaces.firstOrNull {
+            it.interfaceClass == PtpConstants.USB_CLASS_PTP &&
+                interfaceHasBulkPair(it) && interfaceHasInterruptIn(it)
+        } ?: interfaces.firstOrNull {
+            it.interfaceClass == PtpConstants.USB_CLASS_PTP && interfaceHasBulkPair(it)
+        } ?: interfaces.firstOrNull {
+            it.interfaceClass == 255 && interfaceHasBulkPair(it)
         }
-        // Fallback: first interface with bulk endpoints (vendor-specific PTP)
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            var hasBulkIn = false
-            var hasBulkOut = false
-            for (e in 0 until iface.endpointCount) {
-                val ep = iface.getEndpoint(e)
-                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    if (ep.direction == UsbConstants.USB_DIR_IN) hasBulkIn = true
-                    if (ep.direction == UsbConstants.USB_DIR_OUT) hasBulkOut = true
-                }
-            }
-            if (hasBulkIn && hasBulkOut) return iface
-        }
-        return null
     }
 }
