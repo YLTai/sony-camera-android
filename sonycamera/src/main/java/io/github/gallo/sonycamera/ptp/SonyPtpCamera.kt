@@ -889,6 +889,30 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 break
             }
 
+            // Some 0x9209 snapshots carry only current value while the per-control
+            // descriptor contains the lens range/enum. Enrich aperture once at init
+            // when the aggregate record does not expose either form.
+            if (setting == CameraExposureSetting.APERTURE &&
+                fromSnapshot != null &&
+                fromSnapshot.enumValues.size < 2 &&
+                fromSnapshot.rangeMin == null &&
+                fromSnapshot.rangeMax == null
+            ) {
+                val controlDesc = transport.sendCommandWithDataShortTimeout(
+                    PtpConstants.OP_SONY_GET_CONTROL_DEVICE_DESC,
+                    1_200,
+                    fromSnapshot.propertyCode
+                )
+                if (controlDesc.isSuccess && controlDesc.data.isNotEmpty()) {
+                    parseExposureDescriptor(controlDesc.data, setting, fromSnapshot.propertyCode)?.let { rich ->
+                        fromSnapshot = rich.copy(
+                            writable = rich.writable || fromSnapshot.writable,
+                            initialValue = fromSnapshot.initialValue ?: rich.initialValue
+                        )
+                    }
+                }
+            }
+
             val descriptor = fromSnapshot ?: probeExposureDescriptor(setting, ids)
             descriptor?.let {
                 exposureDescriptors[setting] = it
@@ -1058,6 +1082,24 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         ensureExposureDescriptors(forceDescriptorProbe)
         val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
         val allData = if (all.isSuccess) all.data else ByteArray(0)
+
+        // Refresh descriptor forms from the live 0x9209 snapshot. This matters for
+        // variable-aperture zoom lenses: the valid F-number floor can change when
+        // focal length changes without reconnecting the USB session. Preserve any
+        // richer init-time form when a later snapshot is sparse.
+        if (allData.isNotEmpty()) {
+            exposureDescriptors.toMap().forEach { (setting, previous) ->
+                parseExposureDescriptor(allData, setting, previous.propertyCode)?.let { latest ->
+                    exposureDescriptors[setting] = latest.copy(
+                        writable = latest.writable || previous.writable,
+                        initialValue = latest.initialValue ?: previous.initialValue,
+                        enumValues = if (latest.enumValues.size >= 2) latest.enumValues else previous.enumValues,
+                        rangeMin = latest.rangeMin ?: previous.rangeMin,
+                        rangeMax = latest.rangeMax ?: previous.rangeMax
+                    )
+                }
+            }
+        }
 
         fun current(descriptor: ExposureDescriptor?): Long? {
             descriptor ?: return null
