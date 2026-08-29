@@ -803,15 +803,13 @@ private fun CameraSettingsStrip(
             CameraSetting.FOCUS_AREA to settings?.focusArea,
             CameraSetting.WHITE_BALANCE to settings?.whiteBalance,
             CameraSetting.METERING_MODE to settings?.meteringMode,
-            CameraSetting.DRIVE_MODE to settings?.driveMode,
             CameraSetting.EXPOSURE_COMPENSATION to settings?.exposureCompensation
         )
         entries.forEachIndexed { index, (setting, property) ->
             if (index > 0) Spacer(Modifier.width(4.dp))
             SonySettingTile(
                 title = shortSettingTitle(setting),
-                value = property?.current?.label
-                    ?: if (setting == CameraSetting.DRIVE_MODE) "USB N/A" else "--",
+                value = property?.current?.label ?: "--",
                 enabled = property?.current != null,
                 active = activeSetting == setting,
                 onClick = { onClick(setting) }
