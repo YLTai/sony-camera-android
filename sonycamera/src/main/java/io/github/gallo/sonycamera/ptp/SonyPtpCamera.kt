@@ -430,12 +430,12 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         return result
     }
 
-    /**
-     * Move the Sony logical AF target. Camera Remote Command exposes AF Area
-     * Position (0xD2DC) as a standalone control; moving the target must not
-     * implicitly press the shutter. A7C II uses a 640x480 logical grid.
-     */
+    /** Move the Sony logical AF target on the a7C II 640x480 logical grid. */
     fun setAfPoint(x: Int, y: Int): String = commandAfPoint("AF TARGET", x, y)
+
+    /** Explicit autofocus trigger used after an AF-area position update. */
+    fun setAutofocusPressed(pressed: Boolean): PtpResponse =
+        setControlDeviceB(PtpConstants.PROP_SONY_SHUTTER_HALF_PRESS, if (pressed) 2 else 1)
 
     /** Diagnostic convenience entry point retained by the demo. */
     fun testAfCenter(): String = commandAfPoint("AF CENTER TEST", 320, 240)
@@ -742,7 +742,10 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
         // One aggregate read lets us inspect both properties without adding
         // another full 0x9209 transaction.
-        val all = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        val all = transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+            700
+        )
         val areaHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_FOCUS_AREA) else null
         val posHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_AF_AREA_POSITION) else null
 
@@ -828,6 +831,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
     private val exposureDescriptors = linkedMapOf<CameraExposureSetting, ExposureDescriptor>()
     @Volatile private var exposureDescriptorsProbed = false
+    @Volatile private var lastExposureState: CameraExposureState? = null
 
     /**
      * Discover exposure controls once per PTP session.
@@ -1126,11 +1130,13 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val shutterDesc = exposureDescriptors[CameraExposureSetting.SHUTTER_SPEED]
         val isoDesc = exposureDescriptors[CameraExposureSetting.ISO]
 
-        return CameraExposureState(
+        val state = CameraExposureState(
             aperture = buildExposureProperty(apertureDesc, current(apertureDesc)),
             shutterSpeed = buildExposureProperty(shutterDesc, current(shutterDesc)),
             iso = buildExposureProperty(isoDesc, current(isoDesc))
         )
+        lastExposureState = state
+        return state
     }
 
     /** Step one setting by one camera-supported value and verify the write. */
@@ -1177,36 +1183,48 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
 
-    /** Set one exact value selected from the Sony-style UI selector. */
+    /**
+     * Set one exact value selected from the Sony-style UI selector.
+     *
+     * Interactive writes must not synchronously perform a full 9209 read before
+     * and after every detent. Send the Sony control immediately, publish an
+     * optimistic state from the last authoritative snapshot, then let the fast
+     * background telemetry poll confirm/correct it.
+     */
     fun setExposureValue(
         setting: CameraExposureSetting,
         rawValue: Long
     ): ExposureAdjustmentResult {
-        val before = readExposureState()
+        ensureExposureDescriptors()
         val descriptor = exposureDescriptors[setting]
-            ?: return ExposureAdjustmentResult(before, false, "${settingLabel(setting)} is unavailable")
+        val before = lastExposureState ?: readExposureState()
+        if (descriptor == null) {
+            return ExposureAdjustmentResult(before, false, "${settingLabel(setting)} is unavailable")
+        }
         val property = before.property(setting)
         if (!property.writable || property.current == null) {
             return ExposureAdjustmentResult(before, false, "${settingLabel(setting)} is locked in this camera mode")
         }
+
         val response = setExposureRaw(descriptor, rawValue)
-        Thread.sleep(170)
-        var after = readExposureState()
-        if (after.property(setting).current?.rawValue != rawValue) {
-            Thread.sleep(230)
-            after = readExposureState()
-        }
-        val applied = after.property(setting).current?.rawValue == rawValue
-        return if (applied) {
-            ExposureAdjustmentResult(after, true)
-        } else {
-            ExposureAdjustmentResult(
-                after,
+        if (!response.isSuccess) {
+            return ExposureAdjustmentResult(
+                before,
                 false,
-                if (response.isSuccess) "Camera did not apply ${formatExposureValue(setting, rawValue)}"
-                else "Camera rejected ${settingLabel(setting)} (${PtpConstants.responseCodeName(response.responseCode)})"
+                "Camera rejected ${settingLabel(setting)} (${PtpConstants.responseCodeName(response.responseCode)})"
             )
         }
+
+        val target = property.options.firstOrNull { it.rawValue == rawValue }
+            ?: CameraExposureOption(rawValue, formatExposureValue(setting, rawValue))
+        val optimisticProperty = property.copy(current = target)
+        val optimistic = when (setting) {
+            CameraExposureSetting.APERTURE -> before.copy(aperture = optimisticProperty)
+            CameraExposureSetting.SHUTTER_SPEED -> before.copy(shutterSpeed = optimisticProperty)
+            CameraExposureSetting.ISO -> before.copy(iso = optimisticProperty)
+        }
+        lastExposureState = optimistic
+        return ExposureAdjustmentResult(optimistic, true)
     }
 
     private fun setExposureRaw(descriptor: ExposureDescriptor, value: Long): PtpResponse {
@@ -1473,7 +1491,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     fun readCameraSettingsState(): CameraSettingsState {
         val response = transport.sendCommandWithDataShortTimeout(
             PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            2_000
+            900
         )
         val data = if (response.isSuccess) response.data else ByteArray(0)
 

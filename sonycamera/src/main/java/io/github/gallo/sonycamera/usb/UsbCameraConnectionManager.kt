@@ -69,10 +69,10 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
-        private const val EXPOSURE_POLL_INTERVAL_MS = 900L
-        private const val SETTINGS_POLL_INTERVAL_MS = 3_000L
-        private const val TELEMETRY_WARMUP_MS = 2_000L
-        private const val CONTROL_POLL_QUIET_MS = 1_000L
+        private const val EXPOSURE_POLL_INTERVAL_MS = 250L
+        private const val SETTINGS_POLL_INTERVAL_MS = 900L
+        private const val TELEMETRY_WARMUP_MS = 700L
+        private const val CONTROL_POLL_QUIET_MS = 220L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -124,15 +124,21 @@ class UsbCameraConnectionManager(
     private val controlEpochLock = Any()
     @Volatile private var controlEpoch = 0L
     @Volatile private var telemetryResumeAtMs = 0L
+    @Volatile private var controlWriteActive = false
+    @Volatile private var afHalfPressHeld = false
+    private var afReleaseJob: Job? = null
+    private var afGeneration = 0L
 
     private fun beginControlWrite(): Long = synchronized(controlEpochLock) {
         controlEpoch += 1L
+        controlWriteActive = true
         telemetryResumeAtMs = Long.MAX_VALUE
         controlEpoch
     }
 
     private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
         if (controlEpoch == epoch) {
+            controlWriteActive = false
             telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
         }
     }
@@ -344,6 +350,13 @@ class UsbCameraConnectionManager(
 
             while (isActive && isLiveviewActive) {
                 try {
+                    // Do not start another GetObject while a user control is waiting.
+                    // The PTP transaction already in flight is allowed to finish; then
+                    // AF/exposure gets the bus before the next live-view frame.
+                    if (controlWriteActive) {
+                        delay(2)
+                        continue
+                    }
                     val frameStart = System.currentTimeMillis()
                     val liveFrame = ptpCamera?.getLiveViewFrameData()
                     val jpeg = liveFrame?.jpeg
@@ -391,7 +404,8 @@ class UsbCameraConnectionManager(
                         // settings reads in the same frame iteration. App-originated writes already
                         // publish their result immediately; these polls are only for camera-side dials.
                         val telemetryNow = System.currentTimeMillis()
-                        if (telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS &&
+                        if (!controlWriteActive &&
+                            telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS &&
                             telemetryNow >= telemetryResumeAtMs
                         ) {
                             if (telemetryNow - lastSettingsPollTime >= SETTINGS_POLL_INTERVAL_MS) {
@@ -500,13 +514,51 @@ class UsbCameraConnectionManager(
                 ?: return@withLock CameraOperationResult.Failure("Camera not connected")
             val safeX = x.coerceIn(0, 639)
             val safeY = y.coerceIn(0, 479)
+
+            // A new tap supersedes the pending release from the previous tap.
+            // If that AF press is still held, release it first so the new point
+            // receives a genuine new focus trigger rather than merely moving a
+            // target under an old half-press.
+            afReleaseJob?.cancel()
+            afReleaseJob = null
+            afGeneration += 1L
+            val generation = afGeneration
+
             val epoch = beginControlWrite()
             try {
                 val started = System.currentTimeMillis()
-                val message = camera.setAfPoint(safeX, safeY)
-                Log.d(TAG, "AF area position command completed in ${System.currentTimeMillis() - started}ms")
+                if (afHalfPressHeld) {
+                    camera.setAutofocusPressed(false)
+                    afHalfPressHeld = false
+                }
+
+                val moveMessage = camera.setAfPoint(safeX, safeY)
+                val pressResult = camera.setAutofocusPressed(true)
+                afHalfPressHeld = true
+                val message = "$moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)}"
+                Log.d(TAG, "AF point+press completed in ${System.currentTimeMillis() - started}ms")
                 _events.emit(CameraEvent.FocusDebug(message))
                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+
+                // Keep half-press long enough for AF to run, but release it in a
+                // separate job so the tap command itself returns immediately.
+                afReleaseJob = scope.launch(Dispatchers.IO) {
+                    delay(320)
+                    controlWriteMutex.withLock {
+                        if (generation != afGeneration || ptpCamera !== camera || !afHalfPressHeld) {
+                            return@withLock
+                        }
+                        val releaseEpoch = beginControlWrite()
+                        try {
+                            camera.setAutofocusPressed(false)
+                            afHalfPressHeld = false
+                        } catch (e: Exception) {
+                            Log.w(TAG, "AF half-press release failed: ${e.message}")
+                        } finally {
+                            endControlWrite(releaseEpoch)
+                        }
+                    }
+                }
                 CameraOperationResult.SuccessWithData(message)
             } catch (e: Exception) {
                 Log.e(TAG, "AF target command failed", e)
@@ -765,6 +817,10 @@ class UsbCameraConnectionManager(
         isLiveviewActive = false
         liveviewJob?.cancel()
         liveviewJob = null
+        afReleaseJob?.cancel()
+        afReleaseJob = null
+        afHalfPressHeld = false
+        controlWriteActive = false
 
         // Cancel any in-flight connect so its finally-block unwinds the
         // resources it allocated rather than silently committing them after

@@ -954,12 +954,12 @@ private fun DialSelectorPanel(
 
     // During a drag we do send camera commands so a small adjustment can be
     // judged on the live image. Sampling is deliberately conflated: every
-    // 150 ms we send only the newest detent, never all detents crossed since
+    // 100 ms we send only the newest detent, never all detents crossed since
     // the previous sample. The caller also cancels any older queued UI write.
     LaunchedEffect(dragging, options) {
         if (!dragging || options.isEmpty()) return@LaunchedEffect
         while (true) {
-            delay(150)
+            delay(100)
             val target = liveTargetRaw ?: continue
             // Compare against what we last commanded, not the latest camera
             // snapshot. That snapshot may still describe the pre-drag value; if
