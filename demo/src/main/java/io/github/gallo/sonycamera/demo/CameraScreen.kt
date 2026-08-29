@@ -113,6 +113,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var capturedThumb by remember { mutableStateOf<Bitmap?>(null) }
             var flash by remember { mutableStateOf(false) }
             var lastError by remember { mutableStateOf<String?>(null) }
+            var focusDebug by remember { mutableStateOf<String?>(null) }
             var focusFrames by remember { mutableStateOf<List<CameraFocusFrame>>(emptyList()) }
             var exposure by remember { mutableStateOf<CameraExposureState?>(null) }
             var cameraSettings by remember { mutableStateOf<CameraSettingsState?>(null) }
@@ -187,6 +188,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         }
                         is CameraEvent.ExposureUpdated -> exposure = event.state
                         is CameraEvent.CameraSettingsUpdated -> cameraSettings = event.state
+                        is CameraEvent.FocusDebug -> focusDebug = event.message
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
                         else -> Unit
@@ -204,6 +206,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     magnification = 1f
                     magnifyPivot = Offset(0.5f, 0.5f)
                     focusPoint = Offset(0.5f, 0.5f)
+                    focusDebug = null
                     queuedAfPoint = null
                     afRequestJob?.cancel()
                     afRequestJob = null
@@ -228,6 +231,12 @@ fun CameraScreen(camera: CameraConnectionClient) {
             }
             LaunchedEffect(capturedThumb) {
                 if (capturedThumb != null) { delay(1200); capturedThumb = null }
+            }
+            LaunchedEffect(focusDebug) {
+                if (focusDebug != null) {
+                    delay(5000)
+                    focusDebug = null
+                }
             }
 
             fun requestAf(x: Int, y: Int) {
@@ -474,6 +483,24 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 )
                 if (flashAlpha > 0f) {
                     Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = flashAlpha)))
+                }
+
+                focusDebug?.let { message ->
+                    Text(
+                        text = message,
+                        color = AfGreen,
+                        fontSize = 10.sp,
+                        lineHeight = 12.sp,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(start = 10.dp, top = if (menusVisible) 64.dp else 10.dp)
+                            .widthIn(max = 360.dp)
+                            .background(Color.Black.copy(alpha = 0.86f), RoundedCornerShape(3.dp))
+                            .border(1.dp, AfGreen.copy(alpha = 0.65f), RoundedCornerShape(3.dp))
+                            .padding(horizontal = 9.dp, vertical = 6.dp)
+                    )
                 }
 
                 lastError?.let { message ->

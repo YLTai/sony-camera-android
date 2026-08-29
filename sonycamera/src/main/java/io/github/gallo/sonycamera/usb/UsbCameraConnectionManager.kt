@@ -533,8 +533,12 @@ class UsbCameraConnectionManager(
                     try {
                         val commandStartedMs = System.currentTimeMillis()
                         val dispatchWaitMs = commandStartedMs - requestedAtMs
+                        val prepStartedMs = System.currentTimeMillis()
+                        val prepDebug = camera.prepareMonitorTapAf()
+                        val prepMs = System.currentTimeMillis() - prepStartedMs
 
-                        // ILCE-7CM2 monitor taps use one Sony Remote Touch action.
+                        // ILCE-7CM2 monitor taps use Remote Touch only when the
+                        // camera itself reports D284=Enable and E083=Spot AF.
                         // The transport call is explicitly high-priority; Live View
                         // never queues in front of it and drops a frame if PTP is busy.
                         if (camera.supportsRemoteTouch()) {
@@ -544,10 +548,10 @@ class UsbCameraConnectionManager(
                                 val commandMs = finishedMs - commandStartedMs
                                 val wireAndAckMs = (commandMs - touch.queueWaitMs).coerceAtLeast(0L)
                                 val totalMs = finishedMs - requestedAtMs
-                                val message = "REMOTE TOUCH x=$safeX y=$safeY | D2E4/9207=" +
-                                    PtpConstants.responseCodeName(touch.responseCode) +
-                                    " | dispatch=${dispatchWaitMs}ms bus=${touch.queueWaitMs}ms" +
-                                    " wire+ack=${wireAndAckMs}ms total=${totalMs}ms"
+                                val message = "AF RT SPOT | $prepDebug | x=$safeX y=$safeY | " +
+                                    "D2E4=${PtpConstants.responseCodeName(touch.responseCode)} | " +
+                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms " +
+                                    "wire+ack=${wireAndAckMs}ms total=${totalMs}ms"
                                 Log.d(TAG, message)
                                 _events.emit(CameraEvent.FocusDebug(message))
                                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
@@ -566,9 +570,13 @@ class UsbCameraConnectionManager(
                             afHalfPressHeld = false
                         }
                         val moveMessage = camera.setAfPoint(safeX, safeY)
+                        // Surface the actual move as soon as D2DC completes; S1 focus
+                        // follows, but no UI/logcat access is required to see the path.
+                        _events.emit(CameraEvent.FocusDebug("$prepDebug | $moveMessage | AF starting"))
                         val pressResult = camera.setAutofocusPressed(true)
                         afHalfPressHeld = true
-                        val message = "$moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)}"
+                        val totalMs = System.currentTimeMillis() - requestedAtMs
+                        val message = "$prepDebug | $moveMessage | AF=${PtpConstants.responseCodeName(pressResult.responseCode)} | total=${totalMs}ms"
                         Log.d(TAG, "Legacy AF point+press completed in ${System.currentTimeMillis() - commandStartedMs}ms")
                         _events.emit(CameraEvent.FocusDebug(message))
                         _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
@@ -1109,6 +1117,7 @@ class UsbCameraConnectionManager(
             _cameraName.value = localCamera.deviceName ?: "Sony a7C II (USB)"
             Log.d(TAG, "USB camera connected: ${localCamera.deviceName}; starting liveview separately")
             _connectionState.value = CameraConnectionState.Ready
+            _events.emit(CameraEvent.FocusDebug("AF READY | ${localCamera.monitorAfDebug()}"))
 
             // Live view is a post-connect operation, matching Sony's sample/API
             // model. The UI can now distinguish a connected camera waiting for
