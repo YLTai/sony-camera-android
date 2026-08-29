@@ -15,6 +15,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -46,6 +47,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -485,19 +487,22 @@ private fun PreviewPane(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var dragTotal by remember { mutableStateOf(0f) }
     val source = sourceFrame
+    val latestMagnifyPivot = rememberUpdatedState(magnifyPivot)
 
     Box(
         modifier = modifier
             .background(Color.Black)
             .clipToBounds()
             .onSizeChanged { containerSize = it }
-            .pointerInput(state, source?.width, source?.height, containerSize, afBusy, magnification, magnifyPivot) {
+            .pointerInput(state, source?.width, source?.height, containerSize, afBusy, magnification) {
                 val bitmap = source ?: return@pointerInput
                 if (state !is CameraConnectionState.Ready) return@pointerInput
                 detectTapGestures(
                     onDoubleTap = { tap ->
-                        val mapped = mapTapToImage(tap, containerSize, bitmap.width, bitmap.height, magnification, magnifyPivot)
-                            ?: return@detectTapGestures
+                        val mapped = mapTapToImage(
+                            tap, containerSize, bitmap.width, bitmap.height,
+                            magnification, latestMagnifyPivot.value
+                        ) ?: return@detectTapGestures
                         val next = nextMagnification(magnification)
                         onMagnificationChange(
                             next,
@@ -506,25 +511,48 @@ private fun PreviewPane(
                     },
                     onTap = { tap ->
                         if (afBusy) return@detectTapGestures
-                        val mapped = mapTapToImage(tap, containerSize, bitmap.width, bitmap.height, magnification, magnifyPivot)
-                            ?: return@detectTapGestures
+                        val mapped = mapTapToImage(
+                            tap, containerSize, bitmap.width, bitmap.height,
+                            magnification, latestMagnifyPivot.value
+                        ) ?: return@detectTapGestures
                         onAfPoint((mapped.x * 639f).toInt(), (mapped.y * 479f).toInt())
                     }
                 )
             }
-            .pointerInput(Unit) {
-                detectVerticalDragGestures(
-                    onDragStart = { dragTotal = 0f },
-                    onVerticalDrag = { _, amount -> dragTotal += amount },
-                    onDragEnd = {
-                        when {
-                            dragTotal < -55f -> onMenuVisibility(false)
-                            dragTotal > 55f -> onMenuVisibility(true)
+            .pointerInput(magnification, source?.width, source?.height, containerSize) {
+                val bitmapWidth = source?.width ?: 0
+                val bitmapHeight = source?.height ?: 0
+                if (magnification > 1f && bitmapWidth > 0 && bitmapHeight > 0) {
+                    val imageRect = fittedImageRect(containerSize, bitmapWidth, bitmapHeight)
+                    var gesturePivot = latestMagnifyPivot.value
+                    detectDragGestures(
+                        onDragStart = {
+                            gesturePivot = magnifyViewportPivot(
+                                containerSize, imageRect, magnification, latestMagnifyPivot.value
+                            )
+                        },
+                        onDrag = { change, amount ->
+                            change.consume()
+                            gesturePivot = panMagnifyPivot(
+                                containerSize, imageRect, magnification, gesturePivot, amount
+                            )
+                            onMagnificationChange(magnification, gesturePivot)
                         }
-                        dragTotal = 0f
-                    },
-                    onDragCancel = { dragTotal = 0f }
-                )
+                    )
+                } else {
+                    detectVerticalDragGestures(
+                        onDragStart = { dragTotal = 0f },
+                        onVerticalDrag = { _, amount -> dragTotal += amount },
+                        onDragEnd = {
+                            when {
+                                dragTotal < -55f -> onMenuVisibility(false)
+                                dragTotal > 55f -> onMenuVisibility(true)
+                            }
+                            dragTotal = 0f
+                        },
+                        onDragCancel = { dragTotal = 0f }
+                    )
+                }
             },
         contentAlignment = Alignment.Center
     ) {
@@ -618,11 +646,6 @@ private fun SonyTopBar(
         Modifier
             .fillMaxWidth()
             .height(74.dp)
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color.Black.copy(alpha = 0.88f), Color.Black.copy(alpha = 0.60f), Color.Transparent)
-                )
-            )
             .padding(horizontal = 10.dp, vertical = 6.dp)
     ) {
         CameraIdentity(
@@ -753,9 +776,6 @@ private fun CameraSettingsStrip(
         modifier = Modifier
             .fillMaxWidth()
             .height(68.dp)
-            .background(
-                Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.72f), Color.Black.copy(alpha = 0.88f)))
-            )
             .padding(bottom = 7.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.Bottom
@@ -879,21 +899,35 @@ private fun DialSelectorPanel(
     onSelect: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var previewIndex by remember(options, currentRaw) {
+    var previewIndex by remember(title, options) {
         val index = options.indexOfFirst { it.rawValue == currentRaw }
         mutableStateOf(if (index >= 0) index else 0)
     }
-    var dragRemainder by remember { mutableStateOf(0f) }
-    var dragging by remember { mutableStateOf(false) }
-    var pendingRaw by remember { mutableStateOf<Long?>(null) }
+    var dragRemainder by remember(title) { mutableStateOf(0f) }
+    var dragging by remember(title) { mutableStateOf(false) }
+    var pendingRaw by remember(title) { mutableStateOf<Long?>(null) }
 
-    LaunchedEffect(currentRaw, options) {
+    LaunchedEffect(currentRaw, options, dragging) {
         if (!dragging) {
             if (pendingRaw == currentRaw) pendingRaw = null
             if (pendingRaw == null) {
                 val index = options.indexOfFirst { it.rawValue == currentRaw }
                 if (index >= 0) previewIndex = index
             }
+        }
+    }
+
+    // If a command is rejected or the camera never echoes the selected value,
+    // eventually return to the authoritative camera state rather than leaving
+    // an optimistic value stuck forever. Normal a7C II echoes arrive well
+    // before this deadline.
+    LaunchedEffect(pendingRaw) {
+        val pending = pendingRaw ?: return@LaunchedEffect
+        delay(3_000)
+        if (pendingRaw == pending && currentRaw != pending) {
+            pendingRaw = null
+            val index = options.indexOfFirst { it.rawValue == currentRaw }
+            if (index >= 0) previewIndex = index
         }
     }
 
@@ -952,7 +986,7 @@ private fun DialSelectorPanel(
                                         val next = (previewIndex + 1).coerceAtMost(options.lastIndex)
                                         if (next != previewIndex) {
                                             previewIndex = next
-                                            options[next].let { pendingRaw = it.rawValue; onSelect(it.rawValue) }
+                                            pendingRaw = options[next].rawValue
                                         }
                                         dragRemainder += detent
                                     }
@@ -960,15 +994,26 @@ private fun DialSelectorPanel(
                                         val next = (previewIndex - 1).coerceAtLeast(0)
                                         if (next != previewIndex) {
                                             previewIndex = next
-                                            options[next].let { pendingRaw = it.rawValue; onSelect(it.rawValue) }
+                                            pendingRaw = options[next].rawValue
                                         }
                                         dragRemainder -= detent
                                     }
                                 },
-                                onDragEnd = { dragging = false; dragRemainder = 0f },
+                                onDragEnd = {
+                                    dragging = false
+                                    dragRemainder = 0f
+                                    val selectedRaw = options.getOrNull(previewIndex)?.rawValue
+                                    if (selectedRaw != null && selectedRaw != currentRaw) {
+                                        pendingRaw = selectedRaw
+                                        onSelect(selectedRaw)
+                                    } else {
+                                        pendingRaw = null
+                                    }
+                                },
                                 onDragCancel = {
                                     dragging = false
                                     dragRemainder = 0f
+                                    pendingRaw = null
                                     val index = options.indexOfFirst { it.rawValue == currentRaw }
                                     if (index >= 0) previewIndex = index
                                 }
@@ -1239,6 +1284,41 @@ private fun magnifyTranslation(container: IntSize, imageRect: Rect, zoom: Float,
     )
 }
 
+private fun magnifyViewportPivot(
+    container: IntSize,
+    imageRect: Rect,
+    zoom: Float,
+    pivot: Offset
+): Offset {
+    if (zoom <= 1f || container == IntSize.Zero || imageRect.width <= 0f || imageRect.height <= 0f) {
+        return Offset(0.5f, 0.5f)
+    }
+    val translation = magnifyTranslation(container, imageRect, zoom, pivot)
+    val cx = container.width / 2f
+    val cy = container.height / 2f
+    val imageCenterX = cx - translation.x / zoom
+    val imageCenterY = cy - translation.y / zoom
+    return Offset(
+        ((imageCenterX - imageRect.left) / imageRect.width).coerceIn(0f, 1f),
+        ((imageCenterY - imageRect.top) / imageRect.height).coerceIn(0f, 1f)
+    )
+}
+
+private fun panMagnifyPivot(
+    container: IntSize,
+    imageRect: Rect,
+    zoom: Float,
+    pivot: Offset,
+    dragAmount: Offset
+): Offset {
+    if (zoom <= 1f || imageRect.width <= 0f || imageRect.height <= 0f) return pivot
+    val center = magnifyViewportPivot(container, imageRect, zoom, pivot)
+    return Offset(
+        (center.x - dragAmount.x / (imageRect.width * zoom)).coerceIn(0f, 1f),
+        (center.y - dragAmount.y / (imageRect.height * zoom)).coerceIn(0f, 1f)
+    )
+}
+
 @Composable
 private fun MagnificationThumbnail(source: Bitmap, zoom: Float, pivot: Offset, modifier: Modifier = Modifier) {
     var size by remember { mutableStateOf(IntSize.Zero) }
@@ -1340,10 +1420,14 @@ private fun mapTapToImage(
 ): Offset? {
     val rect = fittedImageRect(container, imageWidth, imageHeight)
     if (rect.width <= 0f || rect.height <= 0f) return null
-    val screenX = (tap.x - rect.left) / rect.width
-    val screenY = (tap.y - rect.top) / rect.height
-    val x = pivot.x + (screenX - pivot.x) / zoom.coerceAtLeast(1f)
-    val y = pivot.y + (screenY - pivot.y) / zoom.coerceAtLeast(1f)
+    val safeZoom = zoom.coerceAtLeast(1f)
+    val translation = magnifyTranslation(container, rect, safeZoom, pivot)
+    val cx = container.width / 2f
+    val cy = container.height / 2f
+    val unscaledX = cx + (tap.x - translation.x - cx) / safeZoom
+    val unscaledY = cy + (tap.y - translation.y - cy) / safeZoom
+    val x = (unscaledX - rect.left) / rect.width
+    val y = (unscaledY - rect.top) / rect.height
     if (x !in 0f..1f || y !in 0f..1f) return null
     return Offset(x, y)
 }

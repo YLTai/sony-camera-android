@@ -41,6 +41,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -70,6 +72,7 @@ class UsbCameraConnectionManager(
         private const val EXPOSURE_POLL_INTERVAL_MS = 900L
         private const val SETTINGS_POLL_INTERVAL_MS = 3_000L
         private const val TELEMETRY_WARMUP_MS = 2_000L
+        private const val CONTROL_POLL_QUIET_MS = 1_000L
         private const val FIRST_LIVEVIEW_PROBE_MS = 4_000L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
@@ -114,6 +117,26 @@ class UsbCameraConnectionManager(
     private var liveviewJob: Job? = null
     private var isLiveviewActive = false
     @Volatile private var postCaptureResumeDeadlineMs = 0L
+
+    // Camera control and telemetry share one PTP transport. A telemetry request
+    // can already be in flight when the user turns a dial; versioning lets us
+    // drop that stale result instead of repainting the UI with the old value.
+    private val controlWriteMutex = Mutex()
+    private val controlEpochLock = Any()
+    @Volatile private var controlEpoch = 0L
+    @Volatile private var telemetryResumeAtMs = 0L
+
+    private fun beginControlWrite(): Long = synchronized(controlEpochLock) {
+        controlEpoch += 1L
+        telemetryResumeAtMs = Long.MAX_VALUE
+        controlEpoch
+    }
+
+    private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
+        if (controlEpoch == epoch) {
+            telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
+        }
+    }
 
     // In-flight connect job. Tracking it lets disconnect / detach cancel a
     // connect attempt that's mid-handshake so its coroutine can run its
@@ -369,16 +392,30 @@ class UsbCameraConnectionManager(
                         // settings reads in the same frame iteration. App-originated writes already
                         // publish their result immediately; these polls are only for camera-side dials.
                         val telemetryNow = System.currentTimeMillis()
-                        if (telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS) {
+                        if (telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS &&
+                            telemetryNow >= telemetryResumeAtMs
+                        ) {
                             if (telemetryNow - lastSettingsPollTime >= SETTINGS_POLL_INTERVAL_MS) {
                                 lastSettingsPollTime = telemetryNow
-                                ptpCamera?.readCameraSettingsState()?.let { settings ->
+                                val pollEpoch = controlEpoch
+                                val settings = ptpCamera?.readCameraSettingsState()
+                                if (settings != null && pollEpoch == controlEpoch &&
+                                    System.currentTimeMillis() >= telemetryResumeAtMs
+                                ) {
                                     _events.emit(CameraEvent.CameraSettingsUpdated(settings))
+                                } else if (settings != null) {
+                                    Log.d(TAG, "Discarded stale settings snapshot from control epoch $pollEpoch")
                                 }
                             } else if (telemetryNow - lastExposurePollTime >= EXPOSURE_POLL_INTERVAL_MS) {
                                 lastExposurePollTime = telemetryNow
-                                ptpCamera?.readExposureState()?.let { exposure ->
+                                val pollEpoch = controlEpoch
+                                val exposure = ptpCamera?.readExposureState()
+                                if (exposure != null && pollEpoch == controlEpoch &&
+                                    System.currentTimeMillis() >= telemetryResumeAtMs
+                                ) {
                                     _events.emit(CameraEvent.ExposureUpdated(exposure))
+                                } else if (exposure != null) {
+                                    Log.d(TAG, "Discarded stale exposure snapshot from control epoch $pollEpoch")
                                 }
                             }
                         }
@@ -504,24 +541,38 @@ class UsbCameraConnectionManager(
         setting: CameraExposureSetting,
         rawValue: Long
     ): CameraOperationResult = withContext(Dispatchers.IO) {
-        val camera = ptpCamera
-            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
-        val result = camera.setExposureValue(setting, rawValue)
-        _events.emit(CameraEvent.ExposureUpdated(result.state))
-        if (result.success) CameraOperationResult.Success
-        else CameraOperationResult.Failure(result.message ?: "Exposure change failed")
+        controlWriteMutex.withLock {
+            val camera = ptpCamera
+                ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+            val epoch = beginControlWrite()
+            try {
+                val result = camera.setExposureValue(setting, rawValue)
+                _events.emit(CameraEvent.ExposureUpdated(result.state))
+                if (result.success) CameraOperationResult.Success
+                else CameraOperationResult.Failure(result.message ?: "Exposure change failed")
+            } finally {
+                endControlWrite(epoch)
+            }
+        }
     }
 
     override suspend fun setCameraSetting(
         setting: CameraSetting,
         rawValue: Long
     ): CameraOperationResult = withContext(Dispatchers.IO) {
-        val camera = ptpCamera
-            ?: return@withContext CameraOperationResult.Failure("Camera not connected")
-        val result = camera.setCameraSettingValue(setting, rawValue)
-        _events.emit(CameraEvent.CameraSettingsUpdated(result.state))
-        if (result.success) CameraOperationResult.Success
-        else CameraOperationResult.Failure(result.message ?: "Camera setting change failed")
+        controlWriteMutex.withLock {
+            val camera = ptpCamera
+                ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+            val epoch = beginControlWrite()
+            try {
+                val result = camera.setCameraSettingValue(setting, rawValue)
+                _events.emit(CameraEvent.CameraSettingsUpdated(result.state))
+                if (result.success) CameraOperationResult.Success
+                else CameraOperationResult.Failure(result.message ?: "Camera setting change failed")
+            } finally {
+                endControlWrite(epoch)
+            }
+        }
     }
 
     override suspend fun takePhoto(): CameraOperationResult = try {
