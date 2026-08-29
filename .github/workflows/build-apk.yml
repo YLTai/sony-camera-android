@@ -55,4 +55,4 @@ jobs:
 
 # Source changes pushed by automation do not retrigger workflows; touching this
 # file from the GitHub connector intentionally starts a fresh validation build.
-# Latest validation target: Sony-style monitor UI + camera settings + monitor tools + LUT.
+# Latest validation target: composition guides + camera-reported aperture limits + dial controls.
