@@ -13,8 +13,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -49,9 +49,8 @@ internal fun FocusPeakingOverlay(
             overlay = null
             return@LaunchedEffect
         }
-        latestSource.filterNotNull().collect { bitmap ->
+        latestSource.filterNotNull().collectLatest { bitmap ->
             overlay = withContext(Dispatchers.Default) { createPeakingMask(bitmap, threshold) }
-            delay(45)
         }
     }
 
@@ -68,7 +67,7 @@ internal fun FocusPeakingOverlay(
 }
 
 private fun createPeakingMask(source: Bitmap, threshold: Int): Bitmap {
-    val sample = if (source.width >= 900 || source.height >= 600) 2 else 1
+    val sample = if (source.width >= 640 || source.height >= 480) 2 else 1
     val width = max(1, source.width / sample)
     val height = max(1, source.height / sample)
     if (width < 3 || height < 3) {

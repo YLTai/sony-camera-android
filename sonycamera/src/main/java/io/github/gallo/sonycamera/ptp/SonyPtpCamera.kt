@@ -1697,7 +1697,13 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             0x8006L -> "DMF"
             else -> "0x%04X".format(raw and 0xFFFF)
         }
-        CameraSetting.FOCUS_AREA -> "0x%04X".format(raw and 0xFFFF)
+        CameraSetting.FOCUS_AREA -> when (raw and 0xFFFF) {
+            1L -> "REGIST"; 2L -> "WIDE"; 3L -> "ZONE"; 4L -> "CENTER"
+            5L -> "SPOT S"; 6L -> "SPOT M"; 7L -> "SPOT L"; 8L -> "EXPAND"
+            9L -> "TRACK ALL"; 10L -> "TRACK SEL"; 11L -> "TRACK AREA"
+            12L -> "TRACK S"; 13L -> "TRACK M"; 14L -> "TRACK L"; 15L -> "TRACK SUBJ"
+            else -> "0x%04X".format(raw and 0xFFFF)
+        }
         CameraSetting.WHITE_BALANCE -> when (raw and 0xFFFF) {
             2L -> "AWB"
             4L -> "DAYLIGHT"

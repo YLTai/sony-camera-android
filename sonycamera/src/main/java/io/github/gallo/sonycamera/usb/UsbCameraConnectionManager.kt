@@ -67,8 +67,8 @@ class UsbCameraConnectionManager(
         // Sony USB liveview typically runs ~10-15 fps due to USB bulk transfer overhead.
         // Polling faster than the camera can produce frames just wastes CPU.
         private const val LIVEVIEW_MIN_FRAME_INTERVAL_MS = 30L // ~33 fps max
-        private const val EXPOSURE_POLL_INTERVAL_MS = 1_200L
-        private const val SETTINGS_POLL_INTERVAL_MS = 2_200L
+        private const val EXPOSURE_POLL_INTERVAL_MS = 120L
+        private const val SETTINGS_POLL_INTERVAL_MS = 250L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -98,7 +98,7 @@ class UsbCameraConnectionManager(
     override val events: SharedFlow<CameraEvent> = _events.asSharedFlow()
 
     private val _liveviewFrames = MutableSharedFlow<Bitmap>(
-        replay = 1,
+        replay = 0,
         extraBufferCapacity = 2,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
     )

@@ -139,7 +139,7 @@ class CameraConnectionClient(
     override val liveviewFrames: SharedFlow<Bitmap> =
         binderFlow
             .flatMapLatest { it?.liveviewFrames ?: emptyFlow() }
-            .shareIn(scope, SharingStarted.Eagerly, replay = 1)
+            .shareIn(scope, SharingStarted.Eagerly, replay = 0)
 
     // ── Commands ────────────────────────────────────────────────────────────
 
