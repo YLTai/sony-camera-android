@@ -1088,7 +1088,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             exposureDescriptors.toMap().forEach { (setting, previous) ->
                 parseExposureDescriptor(allData, setting, previous.propertyCode)?.let { latest ->
                     exposureDescriptors[setting] = latest.copy(
-                        writable = latest.writable || previous.writable,
+                        writable = latest.writable,
                         initialValue = latest.initialValue ?: previous.initialValue,
                         enumValues = if (latest.enumValues.size >= 2) latest.enumValues else previous.enumValues,
                         rangeMin = latest.rangeMin ?: previous.rangeMin,

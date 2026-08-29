@@ -211,6 +211,12 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     showLutPanel = false
                 }
             }
+            LaunchedEffect(exposure, activeExposure) {
+                val selected = activeExposure ?: return@LaunchedEffect
+                if (exposure?.property(selected)?.writable != true) {
+                    activeExposure = null
+                }
+            }
             LaunchedEffect(flash) {
                 if (flash) { delay(55); flash = false }
             }
@@ -599,11 +605,13 @@ private fun PreviewPane(
                 }
             }
 
-            CompositionGuideOverlay(
-                source = source,
-                guide = compositionGuide,
-                modifier = Modifier.fillMaxSize()
-            )
+            if (magnification <= 1f) {
+                CompositionGuideOverlay(
+                    source = source,
+                    guide = compositionGuide,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
 
             if (magnification > 1f) {
                 Text(
@@ -666,21 +674,24 @@ private fun SonyTopBar(
             SonyParameterTile(
                 label = "F NO.",
                 value = exposure?.aperture?.current?.label ?: "--",
-                enabled = state is CameraConnectionState.Ready && exposure?.aperture?.current != null,
+                enabled = state is CameraConnectionState.Ready &&
+                    exposure?.aperture?.current != null && exposure?.aperture?.writable == true,
                 active = activeExposure == CameraExposureSetting.APERTURE,
                 onClick = { onExposureClick(CameraExposureSetting.APERTURE) }
             )
             SonyParameterTile(
                 label = "SHUTTER",
                 value = exposure?.shutterSpeed?.current?.label ?: "--",
-                enabled = state is CameraConnectionState.Ready && exposure?.shutterSpeed?.current != null,
+                enabled = state is CameraConnectionState.Ready &&
+                    exposure?.shutterSpeed?.current != null && exposure?.shutterSpeed?.writable == true,
                 active = activeExposure == CameraExposureSetting.SHUTTER_SPEED,
                 onClick = { onExposureClick(CameraExposureSetting.SHUTTER_SPEED) }
             )
             SonyParameterTile(
                 label = "ISO",
                 value = exposure?.iso?.current?.label?.let { if (it == "AUTO") "AUTO" else it } ?: "--",
-                enabled = state is CameraConnectionState.Ready && exposure?.iso?.current != null,
+                enabled = state is CameraConnectionState.Ready &&
+                    exposure?.iso?.current != null && exposure?.iso?.writable == true,
                 active = activeExposure == CameraExposureSetting.ISO,
                 onClick = { onExposureClick(CameraExposureSetting.ISO) }
             )
@@ -708,11 +719,12 @@ private fun CameraIdentity(state: CameraConnectionState, cameraName: String?, mo
         val ready = state is CameraConnectionState.Ready
         Box(Modifier.size(7.dp).background(if (ready) AfGreen else Color.Gray, CircleShape))
         Spacer(Modifier.width(7.dp))
-        Column {
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
             Text(
                 cameraName ?: "SONY MONITOR",
                 color = Color.White,
                 fontSize = 11.sp,
+                lineHeight = 11.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -721,6 +733,7 @@ private fun CameraIdentity(state: CameraConnectionState, cameraName: String?, mo
                 if (ready) "USB  •  LIVE" else connectionLabel(state),
                 color = if (ready) AfGreen else Color.White.copy(alpha = 0.55f),
                 fontSize = 8.sp,
+                lineHeight = 9.sp,
                 fontWeight = FontWeight.Bold
             )
         }
@@ -797,7 +810,8 @@ private fun CameraSettingsStrip(
             if (index > 0) Spacer(Modifier.width(4.dp))
             SonySettingTile(
                 title = shortSettingTitle(setting),
-                value = property?.current?.label ?: "--",
+                value = property?.current?.label
+                    ?: if (setting == CameraSetting.DRIVE_MODE) "USB N/A" else "--",
                 enabled = property?.current != null,
                 active = activeSetting == setting,
                 onClick = { onClick(setting) }
@@ -1079,26 +1093,25 @@ private fun DialSelectorPanel(
                         val distance = index.toFloat() - dialPosition
                         val absDistance = kotlin.math.abs(distance)
                         if (absDistance > 3.2f) continue
-                        val isCenter = absDistance < 0.5f
+                        val visualScale = (1f - absDistance * 0.22f).coerceIn(0.45f, 1f)
+                        val visualAlpha = (1f - absDistance * 0.32f).coerceIn(0.12f, 1f)
                         Text(
                             text = option.label,
-                            color = if (isCenter) Color.White else Color.White.copy(
-                                alpha = when {
-                                    absDistance < 1.35f -> 0.50f
-                                    absDistance < 2.35f -> 0.24f
-                                    else -> 0.12f
-                                }
-                            ),
-                            fontSize = if (isCenter) 20.sp else if (absDistance < 1.35f) 11.sp else 9.sp,
-                            lineHeight = if (isCenter) 23.sp else 13.sp,
-                            fontWeight = if (isCenter) FontWeight.Bold else FontWeight.Medium,
+                            color = Color.White.copy(alpha = visualAlpha),
+                            fontSize = 20.sp,
+                            lineHeight = 23.sp,
+                            fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             textAlign = TextAlign.Center,
                             modifier = Modifier
                                 .align(Alignment.Center)
                                 .width(82.dp)
-                                .graphicsLayer { translationX = distance * 88.dp.toPx() }
+                                .graphicsLayer {
+                                    translationX = distance * 88.dp.toPx()
+                                    scaleX = visualScale
+                                    scaleY = visualScale
+                                }
                         )
                     }
                 }
@@ -1532,7 +1545,7 @@ private fun shortSettingTitle(setting: CameraSetting): String = when (setting) {
     CameraSetting.FOCUS_AREA -> "AF AREA"
     CameraSetting.WHITE_BALANCE -> "WB"
     CameraSetting.METERING_MODE -> "METER"
-    CameraSetting.DRIVE_MODE -> "DRIVE"
+    CameraSetting.DRIVE_MODE -> "DRIVE MODE"
     CameraSetting.EXPOSURE_COMPENSATION -> "EV"
 }
 
