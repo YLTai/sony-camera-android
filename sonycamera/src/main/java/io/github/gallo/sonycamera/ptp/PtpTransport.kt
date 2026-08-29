@@ -229,7 +229,7 @@ class PtpTransport(
         }
 
         val data = output.toByteArray()
-        val response = readResponse(txId)
+        val response = readResponse(txId, timeoutMs)
         PtpDataResponse(response.responseCode, responseTxId, data)
     }
 
