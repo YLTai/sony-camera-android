@@ -140,57 +140,109 @@ class UsbCameraConnectionManager(
         val x: Int,
         val y: Int,
         val requestedAtMs: Long,
-        val ackAtMs: Long
+        val ackAtMs: Long,
+        val commandDoneAtMs: Long,
+        val path: String,
+        val s1Ms: Long?,
+        val baseline: CameraFocusFrameInfo?,
+        var firstGeometryChangeAtMs: Long? = null
     )
+
+    private data class FocusTargetDistance(
+        val dxPx: Float,
+        val dyPx: Float
+    ) {
+        val maxErrorPx: Float get() = maxOf(abs(dxPx), abs(dyPx))
+    }
 
     private val afStateLock = Any()
     @Volatile private var pendingAfFrameLatency: PendingAfFrameLatency? = null
+    @Volatile private var latestFocusFrameInfo: CameraFocusFrameInfo? = null
 
-    private fun focusFramesContainTarget(info: CameraFocusFrameInfo, x: Int, y: Int): Boolean {
-        if (info.frames.isEmpty()) return false
+    private fun focusGeometryChanged(
+        before: CameraFocusFrameInfo?,
+        after: CameraFocusFrameInfo
+    ): Boolean {
+        val oldFrames = before?.frames ?: return false
+        if (oldFrames.size != after.frames.size) return true
+        return oldFrames.indices.any { index ->
+            val old = oldFrames[index]
+            val new = after.frames[index]
+            old.xNumerator != new.xNumerator || old.yNumerator != new.yNumerator ||
+                old.xDenominator != new.xDenominator || old.yDenominator != new.yDenominator ||
+                old.width != new.width || old.height != new.height
+        }
+    }
+
+    private fun nearestFocusTargetDistance(
+        info: CameraFocusFrameInfo,
+        x: Int,
+        y: Int
+    ): FocusTargetDistance? {
+        if (info.frames.isEmpty()) return null
         val targetX = x / 639f
         val targetY = y / 479f
-        return info.frames.any { frame ->
-            val toleranceX = maxOf(0.025f, frame.widthNormalized * 0.75f)
-            val toleranceY = maxOf(0.030f, frame.heightNormalized * 0.75f)
-            abs(frame.centerXNormalized - targetX) <= toleranceX &&
-                abs(frame.centerYNormalized - targetY) <= toleranceY
-        }
+        return info.frames.map { frame ->
+            FocusTargetDistance(
+                dxPx = (frame.centerXNormalized - targetX) * 639f,
+                dyPx = (frame.centerYNormalized - targetY) * 479f
+            )
+        }.minByOrNull { it.maxErrorPx }
     }
 
     private fun observeAfFrameLatency(info: CameraFocusFrameInfo) {
         val pending = synchronized(afStateLock) { pendingAfFrameLatency } ?: return
         val now = System.currentTimeMillis()
-        val matched = focusFramesContainTarget(info, pending.x, pending.y)
+
+        if (pending.firstGeometryChangeAtMs == null && focusGeometryChanged(pending.baseline, info)) {
+            synchronized(afStateLock) {
+                val current = pendingAfFrameLatency
+                if (current?.generation == pending.generation && current.firstGeometryChangeAtMs == null) {
+                    current.firstGeometryChangeAtMs = now
+                }
+            }
+        }
+
+        val nearest = nearestFocusTargetDistance(info, pending.x, pending.y)
+        // The old metric used 75% of the returned frame size as tolerance, so a
+        // stale/large frame could count as the new target long before it moved.
+        // Use an absolute camera-grid tolerance instead: 12 px on the 640x480 grid.
+        val matched = nearest != null && nearest.maxErrorPx <= 12f
         val elapsed = now - pending.requestedAtMs
-        if (!matched && elapsed < 1_500L) return
+        if (!matched && elapsed < 2_000L) return
 
         val claimed = synchronized(afStateLock) {
             val current = pendingAfFrameLatency
             if (current?.generation != pending.generation) {
-                false
+                null
             } else {
                 pendingAfFrameLatency = null
-                true
+                current
             }
-        }
-        if (!claimed) return
+        } ?: return
 
-        val ackMs = pending.ackAtMs - pending.requestedAtMs
-        if (matched) {
-            val frameMs = now - pending.requestedAtMs
-            val afterAckMs = now - pending.ackAtMs
+        val ackMs = claimed.ackAtMs - claimed.requestedAtMs
+        val commandMs = claimed.commandDoneAtMs - claimed.requestedAtMs
+        val changedMs = claimed.firstGeometryChangeAtMs?.minus(claimed.requestedAtMs)
+        val s1Text = claimed.s1Ms?.let { " s1=${it}ms" } ?: ""
+        if (matched && nearest != null) {
+            val frameMs = now - claimed.requestedAtMs
+            val afterAckMs = now - claimed.ackAtMs
+            val afterCommandMs = now - claimed.commandDoneAtMs
             _events.tryEmit(
                 CameraEvent.FocusDebug(
-                    "AF CAMERA FRAME | x=${pending.x} y=${pending.y} | " +
-                        "ack=${ackMs}ms frame=${frameMs}ms afterAck=${afterAckMs}ms"
+                    "AF FRAME ${claimed.path} x=${claimed.x} y=${claimed.y}\n" +
+                        "ack=${ackMs}ms$s1Text cmd=${commandMs}ms change=${changedMs?.let { "${it}ms" } ?: "n/a"}\n" +
+                        "target=${frameMs}ms afterAck=${afterAckMs}ms afterCmd=${afterCommandMs}ms err<=${nearest.maxErrorPx.toInt()}px"
                 )
             )
         } else {
+            val nearestText = nearest?.maxErrorPx?.toInt()?.let { " nearest=${it}px" } ?: " no-frame"
             _events.tryEmit(
                 CameraEvent.FocusDebug(
-                    "AF CAMERA FRAME | x=${pending.x} y=${pending.y} | " +
-                        "ack=${ackMs}ms frame=>1500ms (target not returned)"
+                    "AF FRAME ${claimed.path} x=${claimed.x} y=${claimed.y}\n" +
+                        "ack=${ackMs}ms$s1Text cmd=${commandMs}ms change=${changedMs?.let { "${it}ms" } ?: "n/a"}\n" +
+                        "target=>2000ms$nearestText"
                 )
             )
         }
@@ -482,6 +534,7 @@ class UsbCameraConnectionManager(
                                     )
                                 }
                             )
+                            latestFocusFrameInfo = cameraInfo
                             observeAfFrameLatency(cameraInfo)
                             if (cameraInfo != lastFocusFrameInfo) {
                                 lastFocusFrameInfo = cameraInfo
@@ -609,9 +662,6 @@ class UsbCameraConnectionManager(
     }
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
-        // "total" on the old Remote Touch path only measured command ACK. For
-        // point-movement UX that is the wrong metric: the user sees the first
-        // Live View FocalFrameInfo carrying the new geometry. Record both.
         val requestedAtMs = System.currentTimeMillis()
         priorityControlIntents.incrementAndGet()
         return try {
@@ -630,16 +680,56 @@ class UsbCameraConnectionManager(
                         val prepMs = System.currentTimeMillis() - prepStartedMs
 
                         afReleaseJob?.cancel()
+                        afReleaseJob = null
                         afGeneration += 1L
                         val generation = afGeneration
 
-                        // A stale S1 from the previous tap can keep the camera in an
-                        // active focusing state. Release it before moving the next area.
+                        // Never carry a fallback S1 hold into a new Remote Touch.
                         if (afHalfPressHeld) {
                             camera.setAutofocusPressed(false)
                             afHalfPressHeld = false
                         }
 
+                        val baseline = latestFocusFrameInfo
+
+                        // a7C II fast path: RemoteTouchOperation (D2E4) with
+                        // FunctionOfRemoteTouchOperation (E083) prepared as Spot AF.
+                        // This is one camera touch action; it does not need a second
+                        // synthetic shutter-half-press transaction.
+                        if (camera.supportsRemoteTouch()) {
+                            val touchStartedMs = System.currentTimeMillis()
+                            val touch = camera.executeRemoteTouch(safeX, safeY)
+                            val touchAckAtMs = System.currentTimeMillis()
+                            val wireAndAckMs = (touchAckAtMs - touchStartedMs - touch.queueWaitMs).coerceAtLeast(0L)
+                            val ackMs = touchAckAtMs - requestedAtMs
+                            if (touch.isSuccess) {
+                                synchronized(afStateLock) {
+                                    pendingAfFrameLatency = PendingAfFrameLatency(
+                                        generation = generation,
+                                        x = safeX,
+                                        y = safeY,
+                                        requestedAtMs = requestedAtMs,
+                                        ackAtMs = touchAckAtMs,
+                                        commandDoneAtMs = touchAckAtMs,
+                                        path = "RT(D2E4)",
+                                        s1Ms = null,
+                                        baseline = baseline
+                                    )
+                                }
+                                val message = "AF RT(D2E4) x=$safeX y=$safeY\n" +
+                                    "$prepDebug\n" +
+                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms wire+ack=${wireAndAckMs}ms ack=${ackMs}ms"
+                                Log.d(TAG, message.replace('\n', ' '))
+                                _events.emit(CameraEvent.FocusDebug(message))
+                                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                                return@withLock CameraOperationResult.SuccessWithData(message)
+                            }
+                            Log.w(TAG, "Remote Touch failed (${PtpConstants.responseCodeName(touch.responseCode)}); using D2DC+S1 fallback")
+                        }
+
+                        // Compatibility fallback: move AF Area Position first, then
+                        // explicitly press S1. This remains available if Remote Touch
+                        // is not exposed/enabled by the connected body.
                         val moveStartedMs = System.currentTimeMillis()
                         val move = camera.moveAfAreaPosition(safeX, safeY)
                         val ackAtMs = System.currentTimeMillis()
@@ -648,8 +738,22 @@ class UsbCameraConnectionManager(
 
                         if (!move.isSuccess) {
                             synchronized(afStateLock) { pendingAfFrameLatency = null }
-                            val message = "AF MOVE | $prepDebug | x=$safeX y=$safeY | " +
-                                "D2DC=${PtpConstants.responseCodeName(move.responseCode)} | ack=${ackMs}ms"
+                            val message = "AF D2DC FAIL x=$safeX y=$safeY\n$prepDebug\n" +
+                                "D2DC=${PtpConstants.responseCodeName(move.responseCode)} ack=${ackMs}ms"
+                            _events.emit(CameraEvent.FocusDebug(message))
+                            return@withLock CameraOperationResult.Failure(message)
+                        }
+
+                        val s1StartedMs = System.currentTimeMillis()
+                        val pressResult = camera.setAutofocusPressed(true)
+                        val s1AckAtMs = System.currentTimeMillis()
+                        val s1Ms = s1AckAtMs - s1StartedMs
+                        afHalfPressHeld = pressResult.isSuccess
+
+                        if (!pressResult.isSuccess) {
+                            synchronized(afStateLock) { pendingAfFrameLatency = null }
+                            val message = "AF D2DC+S1 FAIL x=$safeX y=$safeY\n$prepDebug\n" +
+                                "moveAck=${ackMs}ms s1=${s1Ms}ms ${PtpConstants.responseCodeName(pressResult.responseCode)}"
                             _events.emit(CameraEvent.FocusDebug(message))
                             return@withLock CameraOperationResult.Failure(message)
                         }
@@ -660,32 +764,20 @@ class UsbCameraConnectionManager(
                                 x = safeX,
                                 y = safeY,
                                 requestedAtMs = requestedAtMs,
-                                ackAtMs = ackAtMs
+                                ackAtMs = ackAtMs,
+                                commandDoneAtMs = s1AckAtMs,
+                                path = "D2DC+S1",
+                                s1Ms = s1Ms,
+                                baseline = baseline
                             )
                         }
 
-                        // Do not insert a frame delay between moving the AF area and
-                        // S1. The previous 90 ms delay imposed an artificial >100 ms
-                        // floor on the first camera-returned focus frame. Keep D2DC
-                        // and S1 in the same high-priority control lane so Live View
-                        // cannot slip another PTP transaction between them.
-                        val s1StartedMs = System.currentTimeMillis()
-                        val pressResult = camera.setAutofocusPressed(true)
-                        val s1AckAtMs = System.currentTimeMillis()
-                        val s1Ms = s1AckAtMs - s1StartedMs
-                        afHalfPressHeld = pressResult.isSuccess
-
-                        val message = "AF MOVE+S1 | $prepDebug | x=$safeX y=$safeY | D2DC=OK | " +
-                            "S1=${PtpConstants.responseCodeName(pressResult.responseCode)} | " +
-                            "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${move.queueWaitMs}ms " +
-                            "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms s1=${s1Ms}ms | waiting FRAME"
-                        Log.d(TAG, message)
+                        val message = "AF D2DC+S1 x=$safeX y=$safeY\n" +
+                            "$prepDebug\n" +
+                            "moveAck=${ackMs}ms s1=${s1Ms}ms bus=${move.queueWaitMs}ms wire+ack=${wireAndAckMs}ms"
+                        Log.d(TAG, message.replace('\n', ' '))
                         _events.emit(CameraEvent.FocusDebug(message))
                         _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-
-                        if (!pressResult.isSuccess) {
-                            return@withLock CameraOperationResult.Failure(message)
-                        }
                         scheduleAutofocusRelease(camera, generation)
                         CameraOperationResult.SuccessWithData(message)
                     } catch (e: Exception) {
@@ -956,6 +1048,7 @@ class UsbCameraConnectionManager(
         afReleaseJob = null
         afHalfPressHeld = false
         synchronized(afStateLock) { pendingAfFrameLatency = null }
+        latestFocusFrameInfo = null
         controlWriteActive = false
         priorityControlIntents.set(0)
 

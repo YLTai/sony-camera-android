@@ -491,12 +491,12 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         color = AfGreen,
                         fontSize = 10.sp,
                         lineHeight = 12.sp,
-                        maxLines = 4,
+                        maxLines = 6,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(start = 10.dp, top = if (menusVisible) 64.dp else 10.dp)
-                            .widthIn(max = 360.dp)
+                            .widthIn(max = 420.dp)
                             .background(Color.Black.copy(alpha = 0.86f), RoundedCornerShape(3.dp))
                             .border(1.dp, AfGreen.copy(alpha = 0.65f), RoundedCornerShape(3.dp))
                             .padding(horizontal = 9.dp, vertical = 6.dp)

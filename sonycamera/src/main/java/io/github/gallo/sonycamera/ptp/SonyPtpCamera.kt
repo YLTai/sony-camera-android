@@ -550,18 +550,38 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val enable = findSonyScalarEnumProperty(
             data, PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS, 0x0002
         )
-        val function = findSonyScalarEnumProperty(
+        var function = findSonyScalarEnumProperty(
             data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
         )
         val enableRaw = enable?.currentValue
-        val functionRaw = function?.currentValue
+        var functionRaw = function?.currentValue
+        var functionWrite: PtpResponse? = null
+
+        // Sony's Remote Touch operation is only the ACTION. Prepare E083 as
+        // Spot AF once per session so a monitor click means "focus here" in one
+        // D2E4 transaction instead of "move AF area, then synthesize S1".
+        if (enableRaw == 1L && function != null && functionRaw != 2L &&
+            function.writable && (function.enumValues.isEmpty() || 2L in function.enumValues)
+        ) {
+            functionWrite = setSonyScalarProperty(function, 2L)
+            if (functionWrite.isSuccess) {
+                val verifyFunction = transport.sendCommandWithDataShortTimeout(
+                    PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+                    500
+                )
+                if (verifyFunction.isSuccess && verifyFunction.data.isNotEmpty()) {
+                    data = verifyFunction.data
+                    function = findSonyScalarEnumProperty(
+                        data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
+                    )
+                    functionRaw = function?.currentValue
+                }
+            }
+        }
         remoteTouchSupported = enableRaw == 1L && functionRaw == 2L
 
-        // For monitor point movement use the same AF Area Position semantics as
-        // Sony's RemoteSampleApp: Flexible/Spot S first, then the XY update.
-        // Do not mutate FunctionOfRemoteTouchOperation here; D2E4 is a remote
-        // touch ACTION and its fast ACK is not proof that the focus-area frame
-        // has moved on the camera.
+        // Keep Spot S prepared as a compatibility fallback for bodies/sessions
+        // that do not expose Remote Touch. The a7C II normally takes D2E4 above.
         var focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
         var spotWrite: PtpResponse? = null
         if (focusArea != null && focusArea.currentValue != 5L) {
@@ -579,12 +599,16 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
 
         val spotReady = focusArea?.currentValue == 5L || spotWrite?.isSuccess == true
-        monitorAfPrepared = spotReady
+        monitorAfPrepared = remoteTouchSupported || spotReady
         monitorAfDebugState = buildString {
-            append("AF AREA SpotS ").append(if (spotReady) "ready" else "NOT READY")
+            if (remoteTouchSupported) append("AF RT SpotAF ready")
+            else append("AF AREA SpotS ").append(if (spotReady) "ready" else "NOT READY")
             append(" rtEn=").append(enableRaw ?: -1)
             append(" func=").append(functionRaw ?: -1)
             append(" area=").append(focusArea?.currentValue ?: -1)
+            if (functionWrite != null) {
+                append(" fset=").append(PtpConstants.responseCodeName(functionWrite.responseCode))
+            }
             if (spotWrite != null) {
                 append(" sset=").append(PtpConstants.responseCodeName(spotWrite.responseCode))
             }
