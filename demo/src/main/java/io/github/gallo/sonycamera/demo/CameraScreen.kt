@@ -906,6 +906,7 @@ private fun DialSelectorPanel(
     var dragRemainder by remember(title) { mutableStateOf(0f) }
     var dragging by remember(title) { mutableStateOf(false) }
     var pendingRaw by remember(title) { mutableStateOf<Long?>(null) }
+    val latestCurrentRaw = rememberUpdatedState(currentRaw)
 
     LaunchedEffect(currentRaw, options, dragging) {
         if (!dragging) {
@@ -1003,7 +1004,7 @@ private fun DialSelectorPanel(
                                     dragging = false
                                     dragRemainder = 0f
                                     val selectedRaw = options.getOrNull(previewIndex)?.rawValue
-                                    if (selectedRaw != null && selectedRaw != currentRaw) {
+                                    if (selectedRaw != null && selectedRaw != latestCurrentRaw.value) {
                                         pendingRaw = selectedRaw
                                         onSelect(selectedRaw)
                                     } else {
@@ -1014,7 +1015,7 @@ private fun DialSelectorPanel(
                                     dragging = false
                                     dragRemainder = 0f
                                     pendingRaw = null
-                                    val index = options.indexOfFirst { it.rawValue == currentRaw }
+                                    val index = options.indexOfFirst { it.rawValue == latestCurrentRaw.value }
                                     if (index >= 0) previewIndex = index
                                 }
                             )
