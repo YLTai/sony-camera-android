@@ -952,7 +952,6 @@ class UsbCameraConnectionManager(
         isLiveviewActive = false
         liveviewJob?.cancel()
         liveviewJob = null
-        afTriggerJob = null
         afReleaseJob?.cancel()
         afReleaseJob = null
         afHalfPressHeld = false
