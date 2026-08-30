@@ -499,6 +499,22 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         return null
     }
 
+    /** Find a scalar Sony property without assuming its wire integer width. */
+    private fun findSonyScalarEnumPropertyAnyType(
+        data: ByteArray,
+        propertyCode: Int
+    ): SonyScalarEnumProperty? {
+        // Sony SDK enums are small integer values, but different bodies expose
+        // individual properties as UINT8/16/32 (and occasionally signed variants).
+        // Let the camera descriptor decide the payload width used for the write.
+        val types = intArrayOf(0x0002, 0x0004, 0x0006, 0x0001, 0x0003, 0x0005)
+        for (type in types) {
+            val descriptor = findSonyScalarEnumProperty(data, propertyCode, type)
+            if (descriptor != null) return descriptor
+        }
+        return null
+    }
+
     private fun setSonyScalarProperty(
         descriptor: SonyScalarEnumProperty,
         value: Long
@@ -547,84 +563,98 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
 
         var data = snapshot.data
-        var enable = findSonyScalarEnumProperty(
-            data, PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS, 0x0002
-        )
-        var function = findSonyScalarEnumProperty(
-            data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
-        )
-        val enableBefore = enable?.currentValue
-        val functionBefore = function?.currentValue
-        var functionWrite: PtpResponse? = null
+        fun property(code: Int): SonyScalarEnumProperty? =
+            findSonyScalarEnumPropertyAnyType(data, code)
 
-        // RemoteTouchOperationEnableStatus (D284) is a STATUS, not a prerequisite
-        // for selecting FunctionOfRemoteTouchOperation (E083). The previous code
-        // only attempted E083 when D284 was already enabled, which can deadlock the
-        // state machine at rtEn=0 -> never select Spot AF -> rtEn remains 0.
-        // Prepare Spot AF whenever the camera exposes E083 and advertises value 2,
-        // then refresh BOTH E083 and D284 from a new 0x9209 snapshot.
-        if (function != null && function.currentValue != 2L &&
-            (function.enumValues.isEmpty() || 2L in function.enumValues)
-        ) {
-            functionWrite = setSonyScalarProperty(function, 2L)
-            if (functionWrite.isSuccess) {
-                val verifyFunction = transport.sendCommandWithDataShortTimeout(
-                    PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-                    500
-                )
-                if (verifyFunction.isSuccess && verifyFunction.data.isNotEmpty()) {
-                    data = verifyFunction.data
-                }
-            }
+        fun refreshProperties(): Boolean {
+            val verify = transport.sendCommandWithDataShortTimeout(
+                PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+                500
+            )
+            if (!verify.isSuccess || verify.data.isEmpty()) return false
+            data = verify.data
+            return true
         }
 
-        enable = findSonyScalarEnumProperty(
-            data, PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS, 0x0002
-        )
-        function = findSonyScalarEnumProperty(
-            data, PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION, 0x0002
-        )
-        val enableAfter = enable?.currentValue
-        val functionAfter = function?.currentValue
-        remoteTouchSupported = enableAfter == 1L && functionAfter == 2L
+        fun writeEnumTarget(
+            descriptor: SonyScalarEnumProperty?,
+            target: Long
+        ): PtpResponse? {
+            if (descriptor == null || descriptor.currentValue == target) return null
+            // Never invent a value the connected camera explicitly omits.
+            if (descriptor.enumValues.isNotEmpty() && target !in descriptor.enumValues) return null
+            val result = setSonyScalarProperty(descriptor, target)
+            if (result.isSuccess) refreshProperties()
+            return result
+        }
 
-        // Do not mutate FocusArea when Remote Touch is ready. Spot/AF-area state can
-        // itself change whether Remote Touch is permitted. This was another source of
-        // self-inflicted fallback: prepare RT, then immediately switch to Spot S.
+        // Sony's own camera UI requires Touch Operation=On and
+        // Function of Touch Operation=Touch Focus before a touch can mean AF.
+        // The Remote SDK adds E083=Spot AF on top of those camera-side settings.
+        // D284 is a read-only enable STATUS, so evaluate it only after all three
+        // prerequisites have been applied and the 0x9209 snapshot refreshed.
+        val touchBefore = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)?.currentValue
+        val touchFunctionBefore = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)?.currentValue
+        val remoteFunctionBefore = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)?.currentValue
+        val remoteEnableBefore = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS)?.currentValue
+
+        var touch = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)
+        val touchWrite = writeEnumTarget(touch, 2L) // CrTouchOperation::On
+        touch = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)
+
+        var touchFunction = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)
+        val touchFunctionWrite = writeEnumTarget(touchFunction, 3L) // CrFunctionOfTouchOperation::Focus
+        touchFunction = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)
+
+        var remoteFunction = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)
+        val remoteFunctionWrite = writeEnumTarget(remoteFunction, 2L) // CrFunctionOfRemoteTouchOperation::Spot_AF
+        remoteFunction = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)
+
+        // Always make one final authoritative read after the full sequence. This
+        // catches D284 transitions that occur only after the camera processes the
+        // preceding property change rather than in the immediate write response.
+        refreshProperties()
+        touch = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)
+        touchFunction = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)
+        remoteFunction = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)
+        val remoteEnable = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS)
+
+        val touchAfter = touch?.currentValue
+        val touchFunctionAfter = touchFunction?.currentValue
+        val remoteFunctionAfter = remoteFunction?.currentValue
+        val remoteEnableAfter = remoteEnable?.currentValue
+        remoteTouchSupported = touchAfter == 2L &&
+            touchFunctionAfter == 3L &&
+            remoteFunctionAfter == 2L &&
+            remoteEnableAfter == 1L
+
+        fun transition(before: Long?, after: Long?): String = when {
+            before == null && after == null -> "na"
+            before == after -> (after ?: -1L).toString()
+            else -> "${before ?: -1}>${after ?: -1}"
+        }
+        fun writeResult(result: PtpResponse?): String =
+            result?.let { ":${PtpConstants.responseCodeName(it.responseCode)}" } ?: ""
+
+        val touchState = "TO=${transition(touchBefore, touchAfter)}${writeResult(touchWrite)}"
+        val touchFunctionState = "TF=${transition(touchFunctionBefore, touchFunctionAfter)}${writeResult(touchFunctionWrite)}"
+        val remoteFunctionState = "RF=${transition(remoteFunctionBefore, remoteFunctionAfter)}${writeResult(remoteFunctionWrite)}"
+        val remoteEnableState = "RT=${transition(remoteEnableBefore, remoteEnableAfter)}"
+
         if (remoteTouchSupported) {
             monitorAfPrepared = true
-            monitorAfDebugState = buildString {
-                append("AF RT SpotAF ready")
-                append(" rtEn=").append(enableAfter ?: -1)
-                append(" func=").append(functionAfter ?: -1)
-                if (enableBefore != enableAfter) {
-                    append(" rt:").append(enableBefore ?: -1).append("->").append(enableAfter ?: -1)
-                }
-                if (functionBefore != functionAfter) {
-                    append(" fn:").append(functionBefore ?: -1).append("->").append(functionAfter ?: -1)
-                }
-                if (functionWrite != null) {
-                    append(" fset=").append(PtpConstants.responseCodeName(functionWrite.responseCode))
-                }
-            }
+            monitorAfDebugState = "AF RT SpotAF ready $touchState $touchFunctionState $remoteFunctionState $remoteEnableState"
             return monitorAfDebugState
         }
 
-        // Only after Remote Touch is confirmed unavailable do we prepare the proven
-        // AF-area fallback. This keeps compatibility without contaminating RT state.
+        // Only if the complete Sony touch-focus chain still leaves D284 disabled
+        // do we prepare the older AF-area fallback.
         var focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
         var spotWrite: PtpResponse? = null
         if (focusArea != null && focusArea.currentValue != 5L) {
             spotWrite = setGenericSettingRaw(focusArea, 5L)
-            if (spotWrite.isSuccess) {
-                val verify = transport.sendCommandWithDataShortTimeout(
-                    PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-                    500
-                )
-                if (verify.isSuccess && verify.data.isNotEmpty()) {
-                    data = verify.data
-                    focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
-                }
+            if (spotWrite.isSuccess && refreshProperties()) {
+                focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
             }
         }
 
@@ -632,18 +662,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         monitorAfPrepared = spotReady
         monitorAfDebugState = buildString {
             append("AF AREA SpotS ").append(if (spotReady) "ready" else "NOT READY")
-            append(" rtEn=").append(enableAfter ?: -1)
-            append(" func=").append(functionAfter ?: -1)
-            if (enableBefore != enableAfter) {
-                append(" rt:").append(enableBefore ?: -1).append("->").append(enableAfter ?: -1)
-            }
-            if (functionBefore != functionAfter) {
-                append(" fn:").append(functionBefore ?: -1).append("->").append(functionAfter ?: -1)
-            }
+            append(" ").append(touchState)
+            append(" ").append(touchFunctionState)
+            append(" ").append(remoteFunctionState)
+            append(" ").append(remoteEnableState)
             append(" area=").append(focusArea?.currentValue ?: -1)
-            if (functionWrite != null) {
-                append(" fset=").append(PtpConstants.responseCodeName(functionWrite.responseCode))
-            }
             if (spotWrite != null) {
                 append(" sset=").append(PtpConstants.responseCodeName(spotWrite.responseCode))
             }
