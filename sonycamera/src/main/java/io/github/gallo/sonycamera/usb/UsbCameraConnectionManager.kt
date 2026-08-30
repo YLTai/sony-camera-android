@@ -78,11 +78,6 @@ class UsbCameraConnectionManager(
         private const val SETTINGS_POLL_INTERVAL_MS = 900L
         private const val TELEMETRY_WARMUP_MS = 700L
         private const val CONTROL_POLL_QUIET_MS = 220L
-        // Diagnostic only: after an ILCE-7CM2 monitor tap, stop issuing any new
-        // Live View GetObject / background telemetry requests for a short window.
-        // The AF command itself is NOT delayed. This isolates whether sustained
-        // PC-Remote polling is starving the camera body's own AF-frame UI update.
-        private const val AF_BODY_SETTLE_QUIET_MS = 650L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -126,7 +121,6 @@ class UsbCameraConnectionManager(
     private var liveviewJob: Job? = null
     private var isLiveviewActive = false
     @Volatile private var postCaptureResumeDeadlineMs = 0L
-    @Volatile private var afLiveviewQuietUntilMs = 0L
 
     // Camera control and telemetry share one PTP transport. A telemetry request
     // can already be in flight when the user turns a dial; versioning lets us
@@ -141,6 +135,9 @@ class UsbCameraConnectionManager(
     private var afReleaseJob: Job? = null
     private var remoteTouchRuntimeProbeJob: Job? = null
     private var afGeneration = 0L
+    // ILCE-7CM2 diagnostic A/B: alternate the two camera-native wire actions
+    // in one session so body-LCD latency can be compared without S1 or fake UI.
+    private var afWireProbeD2dcNext = true
 
     private data class PendingAfFrameLatency(
         val generation: Long,
@@ -383,10 +380,7 @@ class UsbCameraConnectionManager(
     private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
         if (controlEpoch == epoch) {
             controlWriteActive = false
-            telemetryResumeAtMs = maxOf(
-                System.currentTimeMillis() + CONTROL_POLL_QUIET_MS,
-                afLiveviewQuietUntilMs
-            )
+            telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
         }
     }
 
@@ -598,16 +592,6 @@ class UsbCameraConnectionManager(
 
             while (isActive && isLiveviewActive) {
                 try {
-                    // ILCE-7CM2 AF isolation: the user control is sent immediately,
-                    // but no NEW GetObject starts during the body-settle window.
-                    // Holding the last real frame is intentional; we never draw a
-                    // synthetic AF result.
-                    val afQuietRemainingMs = afLiveviewQuietUntilMs - System.currentTimeMillis()
-                    if (afQuietRemainingMs > 0L) {
-                        delay(minOf(5L, afQuietRemainingMs))
-                        continue
-                    }
-
                     // Do not start another GetObject while a user control is waiting.
                     // The PTP transaction already in flight is allowed to finish; then
                     // AF/exposure gets the bus before the next live-view frame.
@@ -795,12 +779,6 @@ class UsbCameraConnectionManager(
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
         val requestedAtMs = System.currentTimeMillis()
-        // Start the quiet window at the actual AF request. Existing in-flight
-        // PTP work may finish, but the Live View producer will not launch another
-        // request. This changes only background load; D2E4 is not delayed.
-        if (ptpCamera?.deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true) {
-            afLiveviewQuietUntilMs = requestedAtMs + AF_BODY_SETTLE_QUIET_MS
-        }
         priorityControlIntents.incrementAndGet()
         return try {
             withContext(Dispatchers.IO) {
@@ -829,7 +807,52 @@ class UsbCameraConnectionManager(
                         }
 
                         val baseline = latestFocusFrameInfo
+                        val a7c2WireProbe = camera.deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true
 
+                        // Controlled same-session A/B test. A uses only AF Area Position
+                        // (D2DC): no S1, no Remote Touch, no Live View pause. Sony's own
+                        // RemoteSampleApp documents AF Area Position as the direct focus-frame
+                        // center move. The next tap uses B (D2E4), then alternates again.
+                        if (a7c2WireProbe && afWireProbeD2dcNext) {
+                            afWireProbeD2dcNext = false
+                            val moveStartedMs = System.currentTimeMillis()
+                            val move = camera.moveAfAreaPosition(safeX, safeY)
+                            val moveAckAtMs = System.currentTimeMillis()
+                            val wireAndAckMs = (moveAckAtMs - moveStartedMs - move.queueWaitMs).coerceAtLeast(0L)
+                            val ackMs = moveAckAtMs - requestedAtMs
+                            if (!move.isSuccess) {
+                                synchronized(afStateLock) { pendingAfFrameLatency = null }
+                                val message = "AF A D2DC-ONLY FAIL x=$safeX y=$safeY\n$prepDebug\n" +
+                                    "D2DC=${PtpConstants.responseCodeName(move.responseCode)} ack=${ackMs}ms next=B"
+                                _events.emit(CameraEvent.FocusDebug(message))
+                                return@withLock CameraOperationResult.Failure(message)
+                            }
+                            synchronized(afStateLock) {
+                                pendingAfFrameLatency = PendingAfFrameLatency(
+                                    generation = generation,
+                                    x = safeX,
+                                    y = safeY,
+                                    requestedAtMs = requestedAtMs,
+                                    ackAtMs = moveAckAtMs,
+                                    commandDoneAtMs = moveAckAtMs,
+                                    path = "A:D2DC-only",
+                                    s1Ms = null,
+                                    baseline = baseline,
+                                    prepDebug = prepDebug
+                                )
+                            }
+                            val message = "AF A D2DC-ONLY x=$safeX y=$safeY\n" +
+                                "$prepDebug\n" +
+                                "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${move.queueWaitMs}ms " +
+                                "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1 next=B"
+                            Log.d(TAG, message.replace('\n', ' '))
+                            _events.emit(CameraEvent.FocusDebug(message))
+                            _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                            return@withLock CameraOperationResult.SuccessWithData(message)
+                        }
+                        if (a7c2WireProbe) afWireProbeD2dcNext = true
+
+                        // B path: Sony RemoteTouchOperation (D2E4), also without S1.
                         // a7C II fast path: RemoteTouchOperation (D2E4). The previous
                         // D2DC-only isolation proved tap -> returned focus geometry -> Compose
                         // is ~0.14 s, so restore the real Remote Touch path and observe Sony's
@@ -849,16 +872,18 @@ class UsbCameraConnectionManager(
                                         requestedAtMs = requestedAtMs,
                                         ackAtMs = touchAckAtMs,
                                         commandDoneAtMs = touchAckAtMs,
-                                        path = "RT(D2E4)",
+                                        path = if (a7c2WireProbe) "B:RT(D2E4)" else "RT(D2E4)",
                                         s1Ms = null,
                                         baseline = baseline,
                                         prepDebug = prepDebug
                                     )
                                 }
-                                val message = "AF RT(D2E4) QUIET x=$safeX y=$safeY\n" +
+                                val message = (if (a7c2WireProbe) "AF B RT(D2E4)" else "AF RT(D2E4)") +
+                                    " x=$safeX y=$safeY\n" +
                                     "$prepDebug\n" +
-                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms wire+ack=${wireAndAckMs}ms ack=${ackMs}ms " +
-                                    "lvQuiet=${AF_BODY_SETTLE_QUIET_MS}ms"
+                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms " +
+                                    "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1" +
+                                    if (a7c2WireProbe) " next=A" else ""
                                 Log.d(TAG, message.replace('\n', ' '))
                                 _events.emit(CameraEvent.FocusDebug(message))
                                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
@@ -1185,7 +1210,7 @@ class UsbCameraConnectionManager(
      */
     private fun closeUsbResources() {
         isLiveviewActive = false
-        afLiveviewQuietUntilMs = 0L
+        afWireProbeD2dcNext = true
         liveviewJob?.cancel()
         liveviewJob = null
         afReleaseJob?.cancel()
