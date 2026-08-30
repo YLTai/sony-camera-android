@@ -657,7 +657,6 @@ class UsbCameraConnectionManager(
                         hasEverGottenFrame = true
                         pipeRecoveryAttempts = 0
                         postCaptureResumeDeadlineMs = 0L
-        afLiveviewQuietUntilMs = 0L
                         lastFrameTime = System.currentTimeMillis()
 
                         if (!monitorAfPostLiveViewPrepared) {
@@ -1186,6 +1185,7 @@ class UsbCameraConnectionManager(
      */
     private fun closeUsbResources() {
         isLiveviewActive = false
+        afLiveviewQuietUntilMs = 0L
         liveviewJob?.cancel()
         liveviewJob = null
         afReleaseJob?.cancel()
