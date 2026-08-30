@@ -565,32 +565,44 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 }
                 2 -> {
                     if (offset + 2 > data.size) continue
-                    val count = u16(data, offset)
+
+                    // PTP3 enumeration descriptors contain TWO candidate lists:
+                    //   1) values valid for Set
+                    //   2) values valid for Get/Set
+                    // A Get-only property such as D284 legitimately has ZERO
+                    // entries in the first list. Treating count=0 as malformed was
+                    // why RemoteTouchOperationEnableStatus disappeared on a7C II.
+                    val setCount = u16(data, offset)
                     offset += 2
-                    if (count !in 1..512 || offset + count * size > data.size) continue
-                    values = List(count) { index ->
+                    if (setCount !in 0..512 || offset + setCount * size > data.size) continue
+                    val setValues = List(setCount) { index ->
                         readUnsignedScalar(data, offset + index * size, size) ?: 0L
                     }
-                    offset += count * size
+                    offset += setCount * size
 
-                    // 2024+ Sony bodies may append a second candidate list that
-                    // supersedes the first. A real next property code is >=0x5000,
-                    // while this secondary count is below 0x0200.
+                    var getSetValues = emptyList<Long>()
                     if (offset + 2 <= data.size) {
-                        val secondaryCount = u16(data, offset)
-                        if (secondaryCount in 1..511 &&
-                            offset + 2 + secondaryCount * size <= data.size
+                        val getSetCount = u16(data, offset)
+                        // A following Sony property header is >=0x5000, so only a
+                        // bounded small value can be the PTP3 second-list count.
+                        if (getSetCount in 0..512 &&
+                            offset + 2 + getSetCount * size <= data.size
                         ) {
-                            val secondaryOffset = offset + 2
-                            values = List(secondaryCount) { index ->
-                                readUnsignedScalar(data, secondaryOffset + index * size, size) ?: 0L
+                            offset += 2
+                            getSetValues = List(getSetCount) { index ->
+                                readUnsignedScalar(data, offset + index * size, size) ?: 0L
                             }
+                            offset += getSetCount * size
                         }
                     }
+                    values = if (getSetValues.isNotEmpty()) getSetValues else setValues
                 }
             }
 
-            val writable = (getSet and 0x80) != 0 || enabled == 1
+            // PTP3 GetSet is 0x00=Get and 0x01=Get/Set. IsEnabled describes
+            // whether the property is currently usable; it does not make a
+            // Get-only status writable.
+            val writable = getSet != 0 && enabled == 1
             return SonyScalarEnumProperty(
                 propertyCode = propertyCode,
                 dataType = dataType,
@@ -732,9 +744,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     /**
      * Prepare the monitor-tap AF path from the camera's actual property state.
      *
-     * Preferred: Sony Remote Touch D2E4 with D284=Enable and E083=Spot AF.
-     * Fallback: Sony sample-app AF Area Position semantics — preselect Spot S
-     * (Flexible Spot S) and move D2DC, then the manager triggers S1 separately.
+     * Preferred on a7C II: Sony Remote Touch D2E4 when D284=Enable.
+     * ILCE-7CM2 does not expose E083; never require it on this body.
+     * Fallback: move D2DC, then the manager triggers S1 separately.
      */
     @Synchronized
     fun prepareMonitorTapAf(): String {
@@ -777,78 +789,36 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             return setSonyScalarProperty(descriptor, target)
         }
 
-        // Sony Camera Remote SDK documents Remote Touch as its own operation:
-        // E083 selects the Remote Touch function and D284 is the authoritative
-        // enable status for D2E4. D047/D283 are the camera body's local touch
-        // settings; keep them visible for diagnosis, but do not invent them as
-        // mandatory Remote Touch gates when the SDK does not state that linkage.
+        // a7C II uses the D-range Remote Touch controls. Sony's PTP3 function
+        // matrix explicitly supports D284 + D2E4 on ILCE-7CM2, while E083 is
+        // NOT supported on this body. D284 is the authoritative Get-only gate.
+        // D047/D283 remain visible so we can verify the camera's local touch mode
+        // (for example D283=9 means Touch Focus + Touch AE OFF).
         val touchBeforeProp = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)
         val touchFunctionBeforeProp = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)
-        val remoteFunctionBeforeProp = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)
         val remoteEnableBeforeProp = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS)
 
-        val directProbeLines = mutableListOf<String>()
-        val aggregateRemoteMissing = remoteFunctionBeforeProp == null && remoteEnableBeforeProp == null
-        if (aggregateRemoteMissing) {
-            // 0x9209 has already told us nothing about the Remote Touch pair.
-            // Bypass it and ask the dedicated Sony command families directly.
-            directProbeLines += probeSonyPropertyDirect(
-                PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION,
-                preferControl = false
-            )
-            directProbeLines += probeSonyPropertyDirect(
-                PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS,
-                preferControl = false
-            )
-            directProbeLines += probeSonyPropertyDirect(
-                PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION,
-                preferControl = true
-            )
-        }
-
-        val remoteFunctionWrite = writeEnumTarget(remoteFunctionBeforeProp, 2L) // Spot_AF
-
-        // SetDeviceProperty is asynchronous in Sony's SDK model. Only perform
-        // the settle loop when the aggregate snapshot actually exposed at least
-        // one Remote Touch property. Re-reading the same missing 0x9209 entries
-        // six times only steals transport time and cannot make them materialize.
-        var settleReads = 0
-        var remoteFunction = remoteFunctionBeforeProp
-        var remoteEnable = remoteEnableBeforeProp
-        if (!aggregateRemoteMissing) {
-            for (attempt in 1..6) {
-                if (remoteFunctionWrite != null || attempt > 1) {
-                    Thread.sleep(if (attempt == 1) 80L else 120L)
-                }
-                if (refreshProperties()) settleReads += 1
-                remoteFunction = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_FUNCTION)
-                remoteEnable = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS)
-                if (remoteFunction?.currentValue == 2L && remoteEnable?.currentValue == 1L) break
-            }
-        }
-
-        val touchAfterProp = property(PtpConstants.PROP_SONY_TOUCH_OPERATION)
-        val touchFunctionAfterProp = property(PtpConstants.PROP_SONY_FUNCTION_OF_TOUCH_OPERATION)
-        val actionProp = property(PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION)
+        val touchAfterProp = touchBeforeProp
+        val touchFunctionAfterProp = touchFunctionBeforeProp
+        val remoteEnable = remoteEnableBeforeProp
 
         val touchBefore = touchBeforeProp?.currentValue
         val touchFunctionBefore = touchFunctionBeforeProp?.currentValue
-        val remoteFunctionBefore = remoteFunctionBeforeProp?.currentValue
         val remoteEnableBefore = remoteEnableBeforeProp?.currentValue
         val touchAfter = touchAfterProp?.currentValue
         val touchFunctionAfter = touchFunctionAfterProp?.currentValue
-        val remoteFunctionAfter = remoteFunction?.currentValue
         val remoteEnableAfter = remoteEnable?.currentValue
 
-        remoteTouchSupported = remoteFunctionAfter == 2L && remoteEnableAfter == 1L
+        // Do not gate a7C II Remote Touch on E083: Sony's function list says the
+        // ILCE-7CM2 does not expose FunctionOfRemoteTouchOperation. D284 alone is
+        // the documented execution-enable status for D2E4.
+        remoteTouchSupported = remoteEnableAfter == 1L
 
         fun transition(before: Long?, after: Long?): String = when {
             before == null && after == null -> "na"
             before == after -> (after ?: -1L).toString()
             else -> "${before ?: -1}>${after ?: -1}"
         }
-        fun writeResult(result: PtpResponse?): String =
-            result?.let { ":${PtpConstants.responseCodeName(it.responseCode)}" } ?: ""
         fun descriptorMeta(descriptor: SonyScalarEnumProperty?, target: Long? = null): String {
             if (descriptor == null) return "missing"
             val candidateState = when {
@@ -862,24 +832,22 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
 
         val touchState = "TO=${transition(touchBefore, touchAfter)} ${descriptorMeta(touchAfterProp, 2L)}"
-        val touchFunctionState = "TF=${transition(touchFunctionBefore, touchFunctionAfter)} ${descriptorMeta(touchFunctionAfterProp, 3L)}"
-        val remoteFunctionState = "RF=${transition(remoteFunctionBefore, remoteFunctionAfter)}${writeResult(remoteFunctionWrite)} ${descriptorMeta(remoteFunction, 2L)}"
+        // Touch Focus is represented by 3, 8 or 9 on current Sony bodies; keep
+        // the raw value visible rather than pretending only value 3 is valid.
+        val touchFocusState = if (touchFunctionAfter in setOf(3L, 8L, 9L)) "focus=Y" else "focus=N"
+        val touchFunctionState = "TF=${transition(touchFunctionBefore, touchFunctionAfter)} $touchFocusState ${descriptorMeta(touchFunctionAfterProp)}"
         val remoteEnableState = "RT=${transition(remoteEnableBefore, remoteEnableAfter)} ${descriptorMeta(remoteEnable, 1L)}"
-        val actionState = "ACT=${actionProp?.currentValue ?: -1} ${descriptorMeta(actionProp)}"
-        val stateLine = buildList {
-            add(touchState)
-            add(touchFunctionState)
-            add(remoteFunctionState)
-            add(remoteEnableState)
-            add(actionState)
-            add("PTP3OPT=${if (sonyPtp3DevicePropertyOptionEnabled) 1 else 0}")
-            add("reads=$settleReads")
-            addAll(directProbeLines)
-        }.joinToString("\n")
+        val stateLine = listOf(
+            touchState,
+            touchFunctionState,
+            "RF=unsupported-on-ILCE-7CM2",
+            remoteEnableState,
+            "PTP3OPT=${if (sonyPtp3DevicePropertyOptionEnabled) 1 else 0}"
+        ).joinToString("\n")
 
         if (remoteTouchSupported) {
             monitorAfPrepared = true
-            monitorAfDebugState = "AF RT SpotAF ready\n$stateLine"
+            monitorAfDebugState = "AF RT D284 ready\n$stateLine"
             return monitorAfDebugState
         }
 
