@@ -145,6 +145,7 @@ class UsbCameraConnectionManager(
         val path: String,
         val s1Ms: Long?,
         val baseline: CameraFocusFrameInfo?,
+        val prepDebug: String,
         var firstGeometryChangeAtMs: Long? = null
     )
 
@@ -232,6 +233,7 @@ class UsbCameraConnectionManager(
             _events.tryEmit(
                 CameraEvent.FocusDebug(
                     "AF FRAME ${claimed.path} x=${claimed.x} y=${claimed.y}\n" +
+                        "${claimed.prepDebug}\n" +
                         "ack=${ackMs}ms$s1Text cmd=${commandMs}ms change=${changedMs?.let { "${it}ms" } ?: "n/a"}\n" +
                         "target=${frameMs}ms afterAck=${afterAckMs}ms afterCmd=${afterCommandMs}ms err<=${nearest.maxErrorPx.toInt()}px"
                 )
@@ -241,6 +243,7 @@ class UsbCameraConnectionManager(
             _events.tryEmit(
                 CameraEvent.FocusDebug(
                     "AF FRAME ${claimed.path} x=${claimed.x} y=${claimed.y}\n" +
+                        "${claimed.prepDebug}\n" +
                         "ack=${ackMs}ms$s1Text cmd=${commandMs}ms change=${changedMs?.let { "${it}ms" } ?: "n/a"}\n" +
                         "target=>2000ms$nearestText"
                 )
@@ -476,6 +479,7 @@ class UsbCameraConnectionManager(
             var lastSettingsPollTime = lastExposurePollTime
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
+            var monitorAfPostLiveViewPrepared = false
             var pipeRecoveryAttempts = 0
             var lastFocusFrameInfo: CameraFocusFrameInfo? = null
             // Time-based stall detection: trip pipe recovery when we haven't
@@ -548,6 +552,28 @@ class UsbCameraConnectionManager(
                         pipeRecoveryAttempts = 0
                         postCaptureResumeDeadlineMs = 0L
                         lastFrameTime = System.currentTimeMillis()
+
+                        if (!monitorAfPostLiveViewPrepared) {
+                            monitorAfPostLiveViewPrepared = true
+                            val camera = ptpCamera
+                            if (camera != null) {
+                                controlWriteMutex.withLock {
+                                    val prepEpoch = beginControlWrite()
+                                    try {
+                                        camera.invalidateMonitorTapAf()
+                                        val postLiveViewPrep = camera.prepareMonitorTapAf()
+                                        Log.d(TAG, "Remote Touch post-LiveView prep: ${postLiveViewPrep.replace('\n', ' ')}")
+                                        _events.emit(
+                                            CameraEvent.FocusDebug(
+                                                "RTSTATE POST-LIVEVIEW\n$postLiveViewPrep"
+                                            )
+                                        )
+                                    } finally {
+                                        endControlWrite(prepEpoch)
+                                    }
+                                }
+                            }
+                        }
 
                         // The Sony USB transport is strictly serial. Do not perform property
                         // snapshots immediately after the first frame, and never stack exposure +
@@ -713,7 +739,8 @@ class UsbCameraConnectionManager(
                                         commandDoneAtMs = touchAckAtMs,
                                         path = "RT(D2E4)",
                                         s1Ms = null,
-                                        baseline = baseline
+                                        baseline = baseline,
+                                        prepDebug = prepDebug
                                     )
                                 }
                                 val message = "AF RT(D2E4) x=$safeX y=$safeY\n" +
@@ -768,7 +795,8 @@ class UsbCameraConnectionManager(
                                 commandDoneAtMs = s1AckAtMs,
                                 path = "D2DC+S1",
                                 s1Ms = s1Ms,
-                                baseline = baseline
+                                baseline = baseline,
+                                prepDebug = prepDebug
                             )
                         }
 

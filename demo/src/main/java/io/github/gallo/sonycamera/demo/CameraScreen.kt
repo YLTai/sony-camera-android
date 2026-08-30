@@ -234,7 +234,7 @@ fun CameraScreen(camera: CameraConnectionClient) {
             }
             LaunchedEffect(focusDebug) {
                 if (focusDebug != null) {
-                    delay(5000)
+                    delay(15000)
                     focusDebug = null
                 }
             }
