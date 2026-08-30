@@ -455,42 +455,94 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         propertyCode: Int,
         dataType: Int
     ): SonyScalarEnumProperty? {
-        val size = scalarSize(dataType)
-        if (size == 0 || data.size < 8 + 6 + size * 2 + 1) return null
-        for (base in 8 until data.size - (6 + size * 2)) {
+        val isArray = (dataType and 0x4000) != 0
+        val elementType = dataType and 0xBFFF
+        val size = scalarSize(elementType)
+        if (size == 0 || data.size < 15) return null
+
+        fun u32At(offset: Int): Long? {
+            if (offset < 0 || offset + 4 > data.size) return null
+            return (data[offset].toLong() and 0xFF) or
+                ((data[offset + 1].toLong() and 0xFF) shl 8) or
+                ((data[offset + 2].toLong() and 0xFF) shl 16) or
+                ((data[offset + 3].toLong() and 0xFF) shl 24)
+        }
+
+        data class ParsedValue(val first: Long?, val nextOffset: Int)
+
+        fun readValue(offset: Int): ParsedValue? {
+            if (!isArray) {
+                val value = readUnsignedScalar(data, offset, size) ?: return null
+                return ParsedValue(value, offset + size)
+            }
+
+            val countLong = u32At(offset) ?: return null
+            if (countLong > 1024L) return null
+            val count = countLong.toInt()
+            val valuesOffset = offset + 4
+            val end = valuesOffset + count * size
+            if (end < valuesOffset || end > data.size) return null
+            val first = if (count > 0) readUnsignedScalar(data, valuesOffset, size) else null
+            return ParsedValue(first, end)
+        }
+
+        // Sony 0x9209 is a concatenation of vendor descriptors. Search for the
+        // requested header but decode its default/current values according to
+        // the PTP array bit (0x4000). Camera Remote SDK exposes many modern
+        // properties, including Remote Touch, as UInt8Array/UInt16Array.
+        for (base in 8 until data.size - 6) {
             if (u16(data, base) != propertyCode || u16(data, base + 2) != dataType) continue
             val getSet = data.getOrNull(base + 4)?.toInt()?.and(0xFF) ?: continue
             val enabled = data.getOrNull(base + 5)?.toInt()?.and(0xFF) ?: continue
             if (enabled !in 0..2) continue
 
-            val currentOffset = base + 6 + size
-            val current = readUnsignedScalar(data, currentOffset, size) ?: continue
-            val formOffset = currentOffset + size
-            val form = data.getOrNull(formOffset)?.toInt()?.and(0xFF) ?: continue
+            val defaultValue = readValue(base + 6) ?: continue
+            val currentValue = readValue(defaultValue.nextOffset) ?: continue
+            var offset = currentValue.nextOffset
+            val form = data.getOrNull(offset)?.toInt()?.and(0xFF) ?: continue
             if (form !in 0..2) continue
+            offset += 1
 
             var values = emptyList<Long>()
             when (form) {
-                1 -> if (formOffset + 1 + size * 3 > data.size) continue
+                1 -> {
+                    // Sony encodes range members as element scalars even when
+                    // the property's SDK datatype is an array.
+                    if (offset + size * 3 > data.size) continue
+                    offset += size * 3
+                }
                 2 -> {
-                    val countOffset = formOffset + 1
-                    if (countOffset + 2 > data.size) continue
-                    val count = u16(data, countOffset)
-                    val valuesOffset = countOffset + 2
-                    if (count !in 1..128 || valuesOffset + count * size > data.size) continue
+                    if (offset + 2 > data.size) continue
+                    val count = u16(data, offset)
+                    offset += 2
+                    if (count !in 1..512 || offset + count * size > data.size) continue
                     values = List(count) { index ->
-                        readUnsignedScalar(data, valuesOffset + index * size, size) ?: 0L
+                        readUnsignedScalar(data, offset + index * size, size) ?: 0L
+                    }
+                    offset += count * size
+
+                    // 2024+ Sony bodies may append a second candidate list that
+                    // supersedes the first. A real next property code is >=0x5000,
+                    // while this secondary count is below 0x0200.
+                    if (offset + 2 <= data.size) {
+                        val secondaryCount = u16(data, offset)
+                        if (secondaryCount in 1..511 &&
+                            offset + 2 + secondaryCount * size <= data.size
+                        ) {
+                            val secondaryOffset = offset + 2
+                            values = List(secondaryCount) { index ->
+                                readUnsignedScalar(data, secondaryOffset + index * size, size) ?: 0L
+                            }
+                        }
                     }
                 }
             }
 
-            // Sony's 0x9209 enabled byte is authoritative for stored settings;
-            // 0x80 getSet entries are momentary controls and remain actionable.
             val writable = (getSet and 0x80) != 0 || enabled == 1
             return SonyScalarEnumProperty(
                 propertyCode = propertyCode,
                 dataType = dataType,
-                currentValue = current,
+                currentValue = currentValue.first,
                 enumValues = values,
                 writable = writable,
                 getSetState = getSet,
@@ -508,7 +560,10 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // Sony SDK enums are small integer values, but different bodies expose
         // individual properties as UINT8/16/32 (and occasionally signed variants).
         // Let the camera descriptor decide the payload width used for the write.
-        val types = intArrayOf(0x0002, 0x0004, 0x0006, 0x0001, 0x0003, 0x0005)
+        val types = intArrayOf(
+            0x4002, 0x4004, 0x4006, 0x4001, 0x4003, 0x4005,
+            0x0002, 0x0004, 0x0006, 0x0001, 0x0003, 0x0005
+        )
         for (type in types) {
             val descriptor = findSonyScalarEnumProperty(data, propertyCode, type)
             if (descriptor != null) return descriptor
@@ -520,7 +575,12 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         descriptor: SonyScalarEnumProperty,
         value: Long
     ): PtpResponse {
-        val size = scalarSize(descriptor.dataType)
+        // 0x9209 may describe a selectable setting as an array type, but Sony's
+        // 0x9205 SetControlDeviceA takes one selected ELEMENT encoded at the
+        // element width. Strip the PTP array bit before building the payload.
+        val elementType = descriptor.dataType and 0xBFFF
+        val size = scalarSize(elementType)
+        require(size > 0) { "Unsupported Sony property type 0x${descriptor.dataType.toString(16)}" }
         val payload = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN).apply {
             when (size) {
                 1 -> put((value and 0xFF).toByte())
@@ -671,26 +731,20 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             return monitorAfDebugState
         }
 
-        // Only after Live View is active and the bounded D284 refresh still says
-        // Disabled do we prepare the compatibility AF-area path.
-        var focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
-        var spotWrite: PtpResponse? = null
-        if (focusArea != null && focusArea.currentValue != 5L) {
-            spotWrite = setGenericSettingRaw(focusArea, 5L)
-            if (spotWrite.isSuccess && refreshProperties()) {
-                focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
-            }
-        }
-
-        val spotReady = focusArea?.currentValue == 5L || spotWrite?.isSuccess == true
-        monitorAfPrepared = spotReady
+        // Remote Touch is unavailable in this camera state. Do not force an old
+        // numeric FocusArea value here: modern Sony bodies expose FocusArea as an
+        // array-typed property and its wire enum is not an ordinal. Sony's sample
+        // AF Area Position action itself selects the movable Spot-S semantics.
+        // Keep D2DC+S1 as a compatibility path without a speculative setting write.
+        val focusArea = findGenericSettingDescriptor(data, CameraSetting.FOCUS_AREA)
+        monitorAfPrepared = true
         monitorAfDebugState = buildString {
-            append("AF AREA SpotS ").append(if (spotReady) "ready" else "NOT READY")
-            append("\n").append(stateLine)
-            append("\narea=").append(focusArea?.currentValue ?: -1)
-            if (spotWrite != null) {
-                append(" sset=").append(PtpConstants.responseCodeName(spotWrite.responseCode))
-            }
+            append("AF AREA direct fallback")
+            append("
+").append(stateLine)
+            append("
+legacyAreaRaw=").append(focusArea?.currentValue ?: -1)
+            append(" (no forced write)")
         }
         return monitorAfDebugState
     }
