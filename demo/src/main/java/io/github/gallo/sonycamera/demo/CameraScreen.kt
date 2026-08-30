@@ -1,6 +1,7 @@
 package io.github.gallo.sonycamera.demo
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -49,6 +50,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -120,6 +122,13 @@ fun CameraScreen(camera: CameraConnectionClient) {
             var afBusy by remember { mutableStateOf(false) }
             var queuedAfPoint by remember { mutableStateOf<Pair<Int, Int>?>(null) }
             var afRequestJob by remember { mutableStateOf<Job?>(null) }
+            // UI-side latency probe. This starts at the actual pointer tap, not
+            // inside the USB manager, so it captures main-thread/event/recompose
+            // delay that the existing PTP ack/metadata timers cannot see.
+            var afTapStartedAtMs by remember { mutableStateOf<Long?>(null) }
+            var afTapTarget by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+            var afUiEventLatencyMs by remember { mutableStateOf<Long?>(null) }
+            var afUiFrameLatencyMs by remember { mutableStateOf<Long?>(null) }
 
             var menusVisible by remember { mutableStateOf(true) }
             var activeExposure by remember { mutableStateOf<CameraExposureSetting?>(null) }
@@ -185,10 +194,50 @@ fun CameraScreen(camera: CameraConnectionClient) {
                         is CameraEvent.FocusFramesUpdated -> {
                             focusFrames = event.info.frames
                             focusPoint = preferredFocusPivot(event.info.frames)
+
+                            val tapAt = afTapStartedAtMs
+                            val target = afTapTarget
+                            if (tapAt != null && target != null && afUiEventLatencyMs == null) {
+                                val targetX = target.first / 639f
+                                val targetY = target.second / 479f
+                                val nearestErrorPx = event.info.frames.minOfOrNull { frame ->
+                                    maxOf(
+                                        kotlin.math.abs(frame.centerXNormalized - targetX) * 639f,
+                                        kotlin.math.abs(frame.centerYNormalized - targetY) * 479f
+                                    )
+                                }
+                                if (nearestErrorPx != null && nearestErrorPx <= 12f) {
+                                    val eventMs = SystemClock.elapsedRealtime() - tapAt
+                                    afUiEventLatencyMs = eventMs
+                                    focusDebug = focusDebug?.substringBefore("\nuiEvent=")?.let {
+                                        "$it\nuiEvent=${eventMs}ms uiFrame=pending"
+                                    }
+
+                                    // Wait for the next Compose frame clock after the camera-returned
+                                    // focus geometry has been assigned to UI state. This is the closest
+                                    // objective phone-side measure of when that real frame can appear.
+                                    withFrameNanos { }
+                                    val frameMs = SystemClock.elapsedRealtime() - tapAt
+                                    afUiFrameLatencyMs = frameMs
+                                    focusDebug = focusDebug?.substringBefore("\nuiEvent=")?.let {
+                                        "$it\nuiEvent=${eventMs}ms uiFrame=${frameMs}ms"
+                                    }
+                                }
+                            }
                         }
                         is CameraEvent.ExposureUpdated -> exposure = event.state
                         is CameraEvent.CameraSettingsUpdated -> cameraSettings = event.state
-                        is CameraEvent.FocusDebug -> focusDebug = event.message
+                        is CameraEvent.FocusDebug -> {
+                            val uiLine = when {
+                                afUiEventLatencyMs != null -> {
+                                    val frameText = afUiFrameLatencyMs?.let { "${it}ms" } ?: "pending"
+                                    "\nuiEvent=${afUiEventLatencyMs}ms uiFrame=$frameText"
+                                }
+                                afTapStartedAtMs != null -> "\nuiEvent=pending uiFrame=pending"
+                                else -> ""
+                            }
+                            focusDebug = event.message + uiLine
+                        }
                         is CameraEvent.Error -> lastError = event.message
                         is CameraEvent.ConnectionLost -> lastError = "Connection lost"
                         else -> Unit
@@ -211,6 +260,10 @@ fun CameraScreen(camera: CameraConnectionClient) {
                     afRequestJob?.cancel()
                     afRequestJob = null
                     afBusy = false
+                    afTapStartedAtMs = null
+                    afTapTarget = null
+                    afUiEventLatencyMs = null
+                    afUiFrameLatencyMs = null
                 }
             }
             LaunchedEffect(menusVisible) {
@@ -243,6 +296,14 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 if (state !is CameraConnectionState.Ready) return
                 val targetX = x.coerceIn(0, 639)
                 val targetY = y.coerceIn(0, 479)
+
+                // Timestamp the pointer-side request before any coroutine / service /
+                // USB dispatch. This lets debug compare real tap-to-phone-display latency
+                // with the manager's command/metadata latency.
+                afTapStartedAtMs = SystemClock.elapsedRealtime()
+                afTapTarget = targetX to targetY
+                afUiEventLatencyMs = null
+                afUiFrameLatencyMs = null
 
                 // Keep at most one latest target while a USB control is in flight.
                 // We intentionally do NOT draw an optimistic focus frame here: the
