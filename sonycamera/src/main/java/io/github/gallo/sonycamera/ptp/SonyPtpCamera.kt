@@ -219,7 +219,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      */
     fun endSession() {
         try {
-            setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 0)
+            setPriorityModeLegacy(0)
             Log.d(TAG, "Released Sony priority — camera regains control")
         } catch (e: Exception) {
             Log.w(TAG, "Error releasing Sony priority: ${e.message}")
@@ -340,7 +340,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // Acquire host control immediately after phase 3. The response can be late
         // on Sony bodies, so the manager uses a successful live-view fetch as the
         // authoritative readiness check instead of trusting this ACK alone.
-        val priority = setControlDeviceA(PtpConstants.PROP_SONY_PRIORITY_MODE, 1)
+        val priority = setPriorityModeLegacy(1)
         Log.d(TAG, "PriorityMode=1: ${PtpConstants.responseCodeName(priority.responseCode)}")
         if (preferProtocol3) {
             Thread.sleep(250)
@@ -1009,8 +1009,29 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     }
 
     /**
+     * PriorityMode is part of the proven PC-Remote session handshake. Keep its
+     * 0x9205 wire shape exactly as it was before the Remote Touch PTP3 option
+     * experiment: one property-code parameter and a UInt8 payload, with NO
+     * Device Property Option parameter. The option=1 form remains available for
+     * Remote Touch/property operations after the session is established.
+     */
+    private fun setPriorityModeLegacy(value: Byte): PtpResponse {
+        val data = byteArrayOf(value)
+        val result = transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
+            data,
+            PtpConstants.PROP_SONY_PRIORITY_MODE
+        )
+        if (!result.isSuccess) {
+            Log.w(TAG, "PriorityMode legacy write($value): " +
+                    PtpConstants.responseCodeName(result.responseCode))
+        }
+        return result
+    }
+
+    /**
      * Send a Sony SetControlDeviceA (0x9205) command with uint8 data payload.
-     * Used for configuration values (PriorityMode, etc.).
+     * Used for configuration values after the session handshake.
      */
     private fun setControlDeviceA(propCode: Int, value: Byte): PtpResponse {
         val data = byteArrayOf(value)
