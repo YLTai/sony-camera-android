@@ -740,10 +740,8 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         monitorAfPrepared = true
         monitorAfDebugState = buildString {
             append("AF AREA direct fallback")
-            append("
-").append(stateLine)
-            append("
-legacyAreaRaw=").append(focusArea?.currentValue ?: -1)
+            append("\n").append(stateLine)
+            append("\nlegacyAreaRaw=").append(focusArea?.currentValue ?: -1)
             append(" (no forced write)")
         }
         return monitorAfDebugState
