@@ -133,6 +133,7 @@ class UsbCameraConnectionManager(
     private val priorityControlIntents = AtomicInteger(0)
     @Volatile private var afHalfPressHeld = false
     private var afReleaseJob: Job? = null
+    private var remoteTouchRuntimeProbeJob: Job? = null
     private var afGeneration = 0L
 
     private data class PendingAfFrameLatency(
@@ -248,6 +249,92 @@ class UsbCameraConnectionManager(
                         "target=>2000ms$nearestText"
                 )
             )
+        }
+    }
+
+    /**
+     * Observe Sony's own Remote Touch state for ~0.9 s after a successful D2E4.
+     * Samples use the transport's non-queued tryLock path, so Live View can lose
+     * an occasional frame but this diagnostic can never wait ahead of a control.
+     * We record the first two value edges because a DOWN/UP-style state may go
+     * active quickly and settle only around the user's visible body-LCD delay.
+     */
+    private fun startRemoteTouchRuntimeProbe(
+        camera: SonyPtpCamera,
+        generation: Long,
+        requestedAtMs: Long,
+        ackAtMs: Long,
+        x: Int,
+        y: Int
+    ) {
+        remoteTouchRuntimeProbeJob?.cancel()
+        val baseline = camera.cachedRemoteTouchRuntimeStatus()
+        remoteTouchRuntimeProbeJob = scope.launch(Dispatchers.IO) {
+            class EdgeTracker(initial: Long?) {
+                private var initialized = initial != null
+                private var previous = initial
+                var firstAtMs: Long? = null
+                    private set
+                var secondAtMs: Long? = null
+                    private set
+
+                fun observe(value: Long?, elapsedMs: Long) {
+                    if (value == null) return
+                    if (!initialized) {
+                        initialized = true
+                        previous = value
+                        return
+                    }
+                    if (value == previous) return
+                    if (firstAtMs == null) firstAtMs = elapsedMs
+                    else if (secondAtMs == null) secondAtMs = elapsedMs
+                    previous = value
+                }
+
+                fun debugText(): String = when {
+                    firstAtMs == null -> "none"
+                    secondAtMs == null -> "${firstAtMs}ms"
+                    else -> "${firstAtMs}/${secondAtMs}ms"
+                }
+            }
+
+            val spotEdges = EdgeTracker(baseline?.focusTouchSpot)
+            val trackingEdges = EdgeTracker(baseline?.focusTracking)
+            val cancelEdges = EdgeTracker(baseline?.cancelEnable)
+            var last = baseline
+            var reads = 0
+            var misses = 0
+
+            // Let setAfPoint() unwind its control-write finally block first.
+            delay(15)
+            val deadlineMs = requestedAtMs + 900L
+            while (isActive && System.currentTimeMillis() < deadlineMs) {
+                if (generation != afGeneration || ptpCamera !== camera) return@launch
+                val sampleAtMs = System.currentTimeMillis()
+                val sample = camera.tryReadRemoteTouchRuntimeStatus(60)
+                if (sample == null) {
+                    misses += 1
+                } else {
+                    reads += 1
+                    last = sample
+                    val elapsed = sampleAtMs - requestedAtMs
+                    spotEdges.observe(sample.focusTouchSpot, elapsed)
+                    trackingEdges.observe(sample.focusTracking, elapsed)
+                    cancelEdges.observe(sample.cancelEnable, elapsed)
+                }
+                delay(45)
+            }
+
+            if (generation != afGeneration || ptpCamera !== camera) return@launch
+            fun value(v: Long?): String = v?.toString() ?: "na"
+            val ackMs = ackAtMs - requestedAtMs
+            val message = "AF CAM RT(D2E4) x=$x y=$y\n" +
+                "ack=${ackMs}ms samples=$reads miss=$misses\n" +
+                "cam0 E004=${value(baseline?.focusTouchSpot)} E005=${value(baseline?.focusTracking)} D285=${value(baseline?.cancelEnable)}\n" +
+                "camEdge E004=${spotEdges.debugText()} E005=${trackingEdges.debugText()} D285=${cancelEdges.debugText()}\n" +
+                "camEnd E004=${value(last?.focusTouchSpot)} E005=${value(last?.focusTracking)} D285=${value(last?.cancelEnable)}"
+            Log.d(TAG, message.replace('\n', ' '))
+            _events.emit(CameraEvent.FocusDebug(message))
         }
     }
 
@@ -718,16 +805,11 @@ class UsbCameraConnectionManager(
 
                         val baseline = latestFocusFrameInfo
 
-                        // a7C II fast path: RemoteTouchOperation (D2E4) with
-                        // FunctionOfRemoteTouchOperation (E083) prepared as Spot AF.
-                        // This is one camera touch action; it does not need a second
-                        // synthetic shutter-half-press transaction.
-                        // Diagnostic isolation for ILCE-7CM2: D2E4 now ACKs in ~5 ms and
-                        // FocalFrameInfo reaches the target in ~100 ms, yet the body LCD AF
-                        // frame is still visibly ~0.5 s late.  Temporarily bypass Remote Touch
-                        // on this body so one tap can measure D2DC by itself, without S1.
-                        val d2dcOnlyProbe = camera.deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true
-                        if (!d2dcOnlyProbe && camera.supportsRemoteTouch()) {
+                        // a7C II fast path: RemoteTouchOperation (D2E4). The previous
+                        // D2DC-only isolation proved tap -> returned focus geometry -> Compose
+                        // is ~0.14 s, so restore the real Remote Touch path and observe Sony's
+                        // own E004/E005/D285 runtime states after the command instead.
+                        if (camera.supportsRemoteTouch()) {
                             val touchStartedMs = System.currentTimeMillis()
                             val touch = camera.executeRemoteTouch(safeX, safeY)
                             val touchAckAtMs = System.currentTimeMillis()
@@ -754,6 +836,14 @@ class UsbCameraConnectionManager(
                                 Log.d(TAG, message.replace('\n', ' '))
                                 _events.emit(CameraEvent.FocusDebug(message))
                                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                                startRemoteTouchRuntimeProbe(
+                                    camera = camera,
+                                    generation = generation,
+                                    requestedAtMs = requestedAtMs,
+                                    ackAtMs = touchAckAtMs,
+                                    x = safeX,
+                                    y = safeY
+                                )
                                 return@withLock CameraOperationResult.SuccessWithData(message)
                             }
                             Log.w(TAG, "Remote Touch failed (${PtpConstants.responseCodeName(touch.responseCode)}); using D2DC+S1 fallback")
@@ -774,34 +864,6 @@ class UsbCameraConnectionManager(
                                 "D2DC=${PtpConstants.responseCodeName(move.responseCode)} ack=${ackMs}ms"
                             _events.emit(CameraEvent.FocusDebug(message))
                             return@withLock CameraOperationResult.Failure(message)
-                        }
-
-                        if (d2dcOnlyProbe) {
-                            // Controlled experiment: do not synthesize a focus result and do
-                            // not press S1.  The only camera-side action is D2DC, so the user's
-                            // observation of the real body AF frame tells us whether the ~0.5 s
-                            // delay belongs to AF-area relocation or to the focus/touch action.
-                            synchronized(afStateLock) {
-                                pendingAfFrameLatency = PendingAfFrameLatency(
-                                    generation = generation,
-                                    x = safeX,
-                                    y = safeY,
-                                    requestedAtMs = requestedAtMs,
-                                    ackAtMs = ackAtMs,
-                                    commandDoneAtMs = ackAtMs,
-                                    path = "D2DC-only",
-                                    s1Ms = null,
-                                    baseline = baseline,
-                                    prepDebug = prepDebug
-                                )
-                            }
-                            val message = "AF D2DC ONLY x=$safeX y=$safeY\n" +
-                                "$prepDebug\n" +
-                                "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${move.queueWaitMs}ms " +
-                                "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1"
-                            Log.d(TAG, message.replace('\n', ' '))
-                            _events.emit(CameraEvent.FocusDebug(message))
-                            return@withLock CameraOperationResult.SuccessWithData(message)
                         }
 
                         val s1StartedMs = System.currentTimeMillis()
@@ -1107,6 +1169,8 @@ class UsbCameraConnectionManager(
         liveviewJob = null
         afReleaseJob?.cancel()
         afReleaseJob = null
+        remoteTouchRuntimeProbeJob?.cancel()
+        remoteTouchRuntimeProbeJob = null
         afHalfPressHeld = false
         synchronized(afStateLock) { pendingAfFrameLatency = null }
         latestFocusFrameInfo = null

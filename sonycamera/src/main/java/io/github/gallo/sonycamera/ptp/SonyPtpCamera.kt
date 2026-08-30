@@ -90,6 +90,16 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     @Volatile
     private var monitorAfDebugState = "AF path not prepared"
 
+    /** Camera-native status values surrounding Sony Remote Touch. */
+    data class RemoteTouchRuntimeStatus(
+        val focusTouchSpot: Long?,
+        val focusTracking: Long?,
+        val cancelEnable: Long?
+    )
+
+    @Volatile
+    private var remoteTouchRuntimeStatus: RemoteTouchRuntimeStatus? = null
+
     @Volatile
     private var loggedLiveViewDataset = false
 
@@ -294,6 +304,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // desired FunctionOfRemoteTouchOperation (E083) must be selected first.
         remoteTouchSupported = false
         monitorAfPrepared = false
+        remoteTouchRuntimeStatus = null
         monitorAfDebugState = "AF path awaiting camera property state"
 
         // libgphoto2 / Sony PC-Remote traces complete SDIOConnect phase 3
@@ -635,6 +646,36 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         return null
     }
 
+    private fun parseRemoteTouchRuntimeStatus(data: ByteArray): RemoteTouchRuntimeStatus {
+        fun value(code: Int): Long? = findSonyScalarEnumPropertyAnyType(data, code)?.currentValue
+        return RemoteTouchRuntimeStatus(
+            focusTouchSpot = value(PtpConstants.PROP_SONY_FOCUS_TOUCH_SPOT_STATUS),
+            focusTracking = value(PtpConstants.PROP_SONY_FOCUS_TRACKING_STATUS),
+            cancelEnable = value(PtpConstants.PROP_SONY_CANCEL_REMOTE_TOUCH_ENABLE_STATUS)
+        )
+    }
+
+    /** Last status seen in an already-required 0x9209 snapshot; no USB I/O. */
+    fun cachedRemoteTouchRuntimeStatus(): RemoteTouchRuntimeStatus? = remoteTouchRuntimeStatus
+
+    /**
+     * Read camera-native Remote Touch runtime status without ever queuing for
+     * the PTP transport. This diagnostic may drop a sample while Live View owns
+     * the bus, but it must never sit in front of a user control or restore the
+     * old long telemetry blocking behavior.
+     */
+    fun tryReadRemoteTouchRuntimeStatus(timeoutMs: Int = 60): RemoteTouchRuntimeStatus? {
+        val response = transport.trySendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+            timeoutMs,
+            *sonyGetAllPropertyParams()
+        ) ?: return null
+        if (!response.isSuccess || response.data.isEmpty()) return null
+        val status = parseRemoteTouchRuntimeStatus(response.data)
+        remoteTouchRuntimeStatus = status
+        return status
+    }
+
     private fun setSonyScalarProperty(
         descriptor: SonyScalarEnumProperty,
         value: Long
@@ -767,6 +808,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
 
         var data = snapshot.data
+        remoteTouchRuntimeStatus = parseRemoteTouchRuntimeStatus(data)
         fun property(code: Int): SonyScalarEnumProperty? =
             findSonyScalarEnumPropertyAnyType(data, code)
 
@@ -1978,6 +2020,9 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     fun readCameraSettingsState(): CameraSettingsState {
         val response = getAllSonyProperties(500)
         val data = if (response.isSuccess) response.data else ByteArray(0)
+        if (data.isNotEmpty()) {
+            remoteTouchRuntimeStatus = parseRemoteTouchRuntimeStatus(data)
+        }
 
         fun prop(setting: CameraSetting): CameraSettingProperty {
             val descriptor = findGenericSettingDescriptor(data, setting)

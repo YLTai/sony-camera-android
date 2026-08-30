@@ -81,6 +81,12 @@ object PtpConstants {
     // one control transaction, matching the SDK's touch-monitoring path.
     const val PROP_SONY_REMOTE_TOUCH_OPERATION = 0xD2E4
     const val PROP_SONY_REMOTE_TOUCH_ENABLE_STATUS = 0xD284
+    // Runtime status around Remote Touch. D285 tells whether the matching
+    // cancel/up action is currently available; E004/E005 are Sony's native
+    // touch-spot / tracking focus states. They are read-only diagnostics here.
+    const val PROP_SONY_CANCEL_REMOTE_TOUCH_ENABLE_STATUS = 0xD285
+    const val PROP_SONY_FOCUS_TOUCH_SPOT_STATUS = 0xE004
+    const val PROP_SONY_FOCUS_TRACKING_STATUS = 0xE005
     const val PROP_SONY_REMOTE_TOUCH_FUNCTION = 0xE083
     const val PROP_SONY_LIVEVIEW_STATE = 0xD221
     const val PROP_SONY_STILL_IMAGE_STORE_DEST = 0xD222
