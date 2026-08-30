@@ -72,6 +72,14 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     @Volatile
     private var sonyExtensionDebug: String = "ext=not-initialized"
 
+    // Camera Control PTP 3 adds a Device Property Option parameter to
+    // SDIO_SetExtDevicePropValue (0x9205), SDIO_ControlDevice (0x9207),
+    // and SDIO_GetAllExtDevicePropInfo (0x9209). option=1 is required to
+    // expose/use extended properties such as FunctionOfRemoteTouchOperation
+    // (E083). Keep protocol-2 bodies on their proven legacy command shape.
+    @Volatile
+    private var sonyPtp3DevicePropertyOptionEnabled = false
+
     // Remote Touch is only usable when the CAMERA reports D284=Enable.
     // Sony's SDK explicitly requires that state; model support alone is not
     // sufficient. FunctionOfRemoteTouchOperation (E083) is prepared as Spot AF.
@@ -94,6 +102,44 @@ class SonyPtpCamera(private val transport: PtpTransport) {
     // Track consecutive liveview errors for adaptive backoff
     @Volatile
     private var consecutiveLiveviewErrors = 0
+
+    private fun sonyPropertyOptionParams(code: Int): IntArray =
+        if (sonyPtp3DevicePropertyOptionEnabled) intArrayOf(code, 1) else intArrayOf(code)
+
+    private fun sonyGetAllPropertyParams(): IntArray =
+        if (sonyPtp3DevicePropertyOptionEnabled) intArrayOf(0, 1) else intArrayOf()
+
+    private fun getAllSonyProperties(timeoutMs: Int): PtpDataResponse =
+        transport.sendCommandWithDataShortTimeout(
+            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
+            timeoutMs,
+            *sonyGetAllPropertyParams()
+        )
+
+    private fun sendSonySetDeviceProperty(data: ByteArray, code: Int): PtpResponse =
+        transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
+            data,
+            *sonyPropertyOptionParams(code)
+        )
+
+    private fun sendSonyControlDevice(
+        data: ByteArray,
+        code: Int,
+        highPriority: Boolean = false
+    ): PtpResponse = if (highPriority) {
+        transport.sendHighPriorityCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
+            data,
+            *sonyPropertyOptionParams(code)
+        )
+    } else {
+        transport.sendCommandWithDataOut(
+            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
+            data,
+            *sonyPropertyOptionParams(code)
+        )
+    }
 
     /**
      * Open a PTP session. Must be called before any other operations.
@@ -238,6 +284,11 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 "${PtpConstants.responseCodeName(extInfo.responseCode)}, ${extInfo.dataSize}B")
         if (!extInfo.isSuccess || extInfo.dataSize == 0) return false
 
+        // The protocol-3 GetExtDeviceInfo request above already asks for
+        // Device Property Option=1. Carry that same official command shape
+        // into every subsequent 0x9205/0x9207/0x9209 transaction.
+        sonyPtp3DevicePropertyOptionEnabled = useProtocol3
+
         // Do not infer Remote Touch readiness from the model name. Sony's SDK
         // requires RemoteTouchOperationEnableStatus (D284) to be Enable, and the
         // desired FunctionOfRemoteTouchOperation (E083) must be selected first.
@@ -269,6 +320,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 append(" sdio3=")
                 append(PtpConstants.responseCodeName(r3?.responseCode ?: 0))
             }
+            append(" propOpt=").append(if (sonyPtp3DevicePropertyOptionEnabled) 1 else 0)
             append(" extInfo=")
             append(PtpConstants.responseCodeName(extInfo.responseCode))
             append("/").append(extInfo.dataSize).append("B")
@@ -588,11 +640,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 4 -> putInt((value and 0xFFFFFFFFL).toInt())
             }
         }.array()
-        return transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
-            payload,
-            descriptor.propertyCode
-        )
+        return sendSonySetDeviceProperty(payload, descriptor.propertyCode)
     }
 
     /**
@@ -698,10 +746,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             return monitorAfDebugState
         }
 
-        var snapshot = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            700
-        )
+        var snapshot = getAllSonyProperties(700)
         if (!snapshot.isSuccess || snapshot.data.isEmpty()) {
             remoteTouchSupported = false
             monitorAfPrepared = false
@@ -714,10 +759,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             findSonyScalarEnumPropertyAnyType(data, code)
 
         fun refreshProperties(): Boolean {
-            val verify = transport.sendCommandWithDataShortTimeout(
-                PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-                500
-            )
+            val verify = getAllSonyProperties(500)
             if (!verify.isSuccess || verify.data.isEmpty()) return false
             data = verify.data
             return true
@@ -830,6 +872,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             add(remoteFunctionState)
             add(remoteEnableState)
             add(actionState)
+            add("PTP3OPT=${if (sonyPtp3DevicePropertyOptionEnabled) 1 else 0}")
             add("reads=$settleReads")
             addAll(directProbeLines)
         }.joinToString("\n")
@@ -883,11 +926,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(packed)
             .array()
-        val result = transport.sendHighPriorityCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
-            data,
-            PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION
-        )
+        val result = sendSonyControlDevice(data, PtpConstants.PROP_SONY_REMOTE_TOUCH_OPERATION, highPriority = true)
         if (result.responseCode == PtpConstants.RESP_OPERATION_NOT_SUPPORTED ||
             result.responseCode == PtpConstants.RESP_PARAMETER_NOT_SUPPORTED
         ) {
@@ -902,7 +941,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
     /**
      * Write Sony AF Area Position (0xD2DC) as a uint32 through
-     * SetControlDeviceB (0x9207). Sony protocol uses a 640x480 logical grid;
+     * SDIO_ControlDevice (0x9207). PTP3 also carries Device Property Option=1; Sony protocol uses a 640x480 logical grid;
      * the packed value is (x << 16) | y.
      */
     private fun setAfAreaPosition(x: Int, y: Int): PtpResponse {
@@ -912,11 +951,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(packed)
             .array()
-        val result = transport.sendHighPriorityCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B,
-            data,
-            PtpConstants.PROP_SONY_AF_AREA_POSITION
-        )
+        val result = sendSonyControlDevice(data, PtpConstants.PROP_SONY_AF_AREA_POSITION, highPriority = true)
         Log.d(TAG, "Set AF Area Position: x=$safeX y=$safeY packed=0x${packed.toUInt().toString(16)} " +
                 "-> ${PtpConstants.responseCodeName(result.responseCode)}")
         return result
@@ -955,9 +990,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val data = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN)
             .putShort(value.toShort())
             .array()
-        val result = transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_B, data, propCode
-        )
+        val result = sendSonyControlDevice(data, propCode)
         if (!result.isSuccess) {
             Log.w(TAG, "SetControlDeviceB(0x${propCode.toString(16)}, $value): " +
                     PtpConstants.responseCodeName(result.responseCode))
@@ -971,9 +1004,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      */
     private fun setControlDeviceA(propCode: Int, value: Byte): PtpResponse {
         val data = byteArrayOf(value)
-        val result = transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A, data, propCode
-        )
+        val result = sendSonySetDeviceProperty(data, propCode)
         if (!result.isSuccess) {
             Log.w(TAG, "SetControlDeviceA(0x${propCode.toString(16)}, $value [u8]): " +
                     PtpConstants.responseCodeName(result.responseCode))
@@ -989,9 +1020,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         val data = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN)
             .putShort(value.toShort())
             .array()
-        val result = transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A, data, propCode
-        )
+        val result = sendSonySetDeviceProperty(data, propCode)
         if (!result.isSuccess) {
             Log.w(TAG, "SetControlDeviceA(0x${propCode.toString(16)}, 0x${value.toString(16)} [u16]): " +
                     PtpConstants.responseCodeName(result.responseCode))
@@ -1062,7 +1091,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             Thread.sleep(1000)
 
             // Poll properties to keep Sony state machine alive
-            transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+            getAllSonyProperties(PtpConstants.USB_TIMEOUT_MS)
 
             // Check for new object handles
             val currentHandles = getObjectHandles(storageId)
@@ -1238,10 +1267,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
 
         // One aggregate read lets us inspect both properties without adding
         // another full 0x9209 transaction.
-        val all = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            700
-        )
+        val all = getAllSonyProperties(700)
         val areaHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_FOCUS_AREA) else null
         val posHit = if (all.isSuccess) findBlobHit(all.data, PtpConstants.PROP_SONY_AF_AREA_POSITION) else null
 
@@ -1342,10 +1368,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         if (exposureDescriptorsProbed && !force) return
         exposureDescriptors.clear()
 
-        val snapshot = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            2_000
-        )
+        val snapshot = getAllSonyProperties(2_000)
         val snapshotData = if (snapshot.isSuccess) snapshot.data else ByteArray(0)
 
         val candidates = linkedMapOf(
@@ -1588,10 +1611,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         // Telemetry is low priority. Bound a busy-camera read so it cannot sit
         // on the shared PTP transport for the global 5-second timeout while a
         // user is waiting to move AF or turn an exposure dial.
-        val all = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            500
-        )
+        val all = getAllSonyProperties(500)
         val allData = if (all.isSuccess) all.data else ByteArray(0)
 
         // Refresh descriptor forms from the live 0x9209 snapshot. This matters for
@@ -1740,11 +1760,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
             }
         }.array()
 
-        val sony = transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
-            data,
-            descriptor.propertyCode
-        )
+        val sony = sendSonySetDeviceProperty(data, descriptor.propertyCode)
         if (sony.isSuccess) return sony
 
         // FNumber is a standard PTP property as well. A few bodies expose it
@@ -1992,10 +2008,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      * snapshot. Unknown values are preserved as hex labels instead of guessed.
      */
     fun readCameraSettingsState(): CameraSettingsState {
-        val response = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            500
-        )
+        val response = getAllSonyProperties(500)
         val data = if (response.isSuccess) response.data else ByteArray(0)
 
         fun prop(setting: CameraSetting): CameraSettingProperty {
@@ -2041,10 +2054,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         setting: CameraSetting,
         rawValue: Long
     ): CameraSettingAdjustmentResult {
-        val snapshot = transport.sendCommandWithDataShortTimeout(
-            PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA,
-            2_000
-        )
+        val snapshot = getAllSonyProperties(2_000)
         val descriptor = if (snapshot.isSuccess) {
             findGenericSettingDescriptor(snapshot.data, setting)
         } else null
@@ -2188,11 +2198,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
                 4 -> putInt((value and 0xFFFFFFFFL).toInt())
             }
         }.array()
-        val sony = transport.sendCommandWithDataOut(
-            PtpConstants.OP_SONY_SET_CONTROL_DEVICE_A,
-            payload,
-            descriptor.propertyCode
-        )
+        val sony = sendSonySetDeviceProperty(payload, descriptor.propertyCode)
         if (sony.isSuccess) return sony
         if (descriptor.propertyCode in 0x5000..0x5FFF) {
             return transport.sendCommandWithDataOut(
@@ -2311,7 +2317,7 @@ class SonyPtpCamera(private val transport: PtpTransport) {
      *   code(2) + dataType(2) + getSet(1) + default(N) + current(N)
      */
     fun getPhotoTransferQueueStatus(): PhotoQueueStatus? {
-        val response = transport.sendCommandWithData(PtpConstants.OP_SONY_GET_ALL_DEVICE_PROP_DATA)
+        val response = getAllSonyProperties(PtpConstants.USB_TIMEOUT_MS)
         if (!response.isSuccess || response.data.size < 20) {
             Log.w(TAG, "GetAllDevicePropData failed: ${PtpConstants.responseCodeName(response.responseCode)}")
             return null
