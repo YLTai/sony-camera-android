@@ -21,8 +21,6 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-        with:
-          distribution: temurin
           java-version: '17'
 
       - name: Setup Android SDK
