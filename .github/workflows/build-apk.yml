@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -16,6 +16,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Apply staged direct-probe patch
+        run: |
+          if [ -f tools/patch_direct_remote_touch_probe.py ]; then
+            python3 tools/patch_direct_remote_touch_probe.py
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "diag: probe Sony remote touch directly"
+              git push
+            fi
+          fi
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -53,4 +66,4 @@ jobs:
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
 
-# Validation target: a7C II Sony 0x9209 parser handles scalar and array PTP property types; Remote Touch E083/D284 can be discovered when exposed as UInt8Array; array selections are written at element width; D2DC+S1 fallback no longer forces a guessed FocusArea raw value; Drive remains removed.
+# Temporary validation: direct 0x9203/0x9204/0x9206 probes identify where a7C II exposes E083/D284/D2E4 when 0x9209 omits them; no AF behavior changes; Drive remains removed.
