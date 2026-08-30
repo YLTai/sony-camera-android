@@ -639,23 +639,31 @@ class SonyPtpCamera(private val transport: PtpTransport) {
         }
         fun writeResult(result: PtpResponse?): String =
             result?.let { ":${PtpConstants.responseCodeName(it.responseCode)}" } ?: ""
-        fun descriptorMeta(descriptor: SonyScalarEnumProperty?): String {
-            if (descriptor == null) return "[missing]"
-            val candidates = if (descriptor.enumValues.isEmpty()) {
-                "-"
-            } else {
-                descriptor.enumValues.joinToString(",")
+        fun descriptorMeta(descriptor: SonyScalarEnumProperty?, target: Long? = null): String {
+            if (descriptor == null) return "missing"
+            val candidateState = when {
+                target == null -> ""
+                descriptor.enumValues.isEmpty() -> " cand=?"
+                target in descriptor.enumValues -> " cand=Y"
+                else -> " cand=N"
             }
-            return "[t=0x${descriptor.dataType.toString(16)} gs=0x${descriptor.getSetState.toString(16)} " +
-                "en=${descriptor.enabledState} w=${if (descriptor.writable) 1 else 0} vals=$candidates]"
+            return "t=0x${descriptor.dataType.toString(16)} gs=0x${descriptor.getSetState.toString(16)} " +
+                "en=${descriptor.enabledState} w=${if (descriptor.writable) 1 else 0}$candidateState"
         }
 
-        val touchState = "TO=${transition(touchBefore, touchAfter)}${descriptorMeta(touchAfterProp)}"
-        val touchFunctionState = "TF=${transition(touchFunctionBefore, touchFunctionAfter)}${descriptorMeta(touchFunctionAfterProp)}"
-        val remoteFunctionState = "RF=${transition(remoteFunctionBefore, remoteFunctionAfter)}${writeResult(remoteFunctionWrite)}${descriptorMeta(remoteFunction)}"
-        val remoteEnableState = "RT=${transition(remoteEnableBefore, remoteEnableAfter)}${descriptorMeta(remoteEnable)}"
-        val actionState = "ACT=${actionProp?.currentValue ?: -1}${descriptorMeta(actionProp)}"
-        val stateLine = "$touchState $touchFunctionState $remoteFunctionState $remoteEnableState $actionState reads=$settleReads"
+        val touchState = "TO=${transition(touchBefore, touchAfter)} ${descriptorMeta(touchAfterProp, 2L)}"
+        val touchFunctionState = "TF=${transition(touchFunctionBefore, touchFunctionAfter)} ${descriptorMeta(touchFunctionAfterProp, 3L)}"
+        val remoteFunctionState = "RF=${transition(remoteFunctionBefore, remoteFunctionAfter)}${writeResult(remoteFunctionWrite)} ${descriptorMeta(remoteFunction, 2L)}"
+        val remoteEnableState = "RT=${transition(remoteEnableBefore, remoteEnableAfter)} ${descriptorMeta(remoteEnable, 1L)}"
+        val actionState = "ACT=${actionProp?.currentValue ?: -1} ${descriptorMeta(actionProp)}"
+        val stateLine = listOf(
+            touchState,
+            touchFunctionState,
+            remoteFunctionState,
+            remoteEnableState,
+            actionState,
+            "reads=$settleReads"
+        ).joinToString("\n")
 
         if (remoteTouchSupported) {
             monitorAfPrepared = true
