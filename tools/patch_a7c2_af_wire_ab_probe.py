@@ -46,6 +46,27 @@ replace_once(
 )
 
 replace_once(
+'''    private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
+        if (controlEpoch == epoch) {
+            controlWriteActive = false
+            telemetryResumeAtMs = maxOf(
+                System.currentTimeMillis() + CONTROL_POLL_QUIET_MS,
+                afLiveviewQuietUntilMs
+            )
+        }
+    }
+''',
+'''    private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
+        if (controlEpoch == epoch) {
+            controlWriteActive = false
+            telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
+        }
+    }
+''',
+"restore telemetry quiet handling",
+)
+
+replace_once(
 '''                    // ILCE-7CM2 AF isolation: the user control is sent immediately,
                     // but no NEW GetObject starts during the body-settle window.
                     // Holding the last real frame is intentional; we never draw a
