@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -16,6 +16,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Apply staged Sony PTP3 property-option fix
+        if: ${{ hashFiles('tools/patch_ptp3_device_property_option.py') != '' }}
+        run: |
+          python3 tools/patch_ptp3_device_property_option.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: use Sony PTP3 device property option"
+          git push
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -53,4 +63,4 @@ jobs:
           path: demo/build/outputs/apk/debug/demo-debug.apk
           if-no-files-found: error
 
-# Validation target: when a7C II omits E083/D284/D2E4 from 0x9209, read-only direct 0x9203/0x9204/0x9206 probes expose response/type/value diagnostics; redundant 0x9209 settle reads are skipped; AF behavior and Drive remain unchanged.
+# Validation target: a7C II/PTP3 uses Sony Camera Control PTP 3 Device Property Option=1 on 0x9205/0x9207/0x9209; 0x9209 full reads use params (0,1), enabling E000 extended properties such as E083; older protocol-2 bodies keep the legacy command shape; Drive remains removed.
