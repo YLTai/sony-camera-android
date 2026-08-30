@@ -78,6 +78,11 @@ class UsbCameraConnectionManager(
         private const val SETTINGS_POLL_INTERVAL_MS = 900L
         private const val TELEMETRY_WARMUP_MS = 700L
         private const val CONTROL_POLL_QUIET_MS = 220L
+        // Diagnostic only: after an ILCE-7CM2 monitor tap, stop issuing any new
+        // Live View GetObject / background telemetry requests for a short window.
+        // The AF command itself is NOT delayed. This isolates whether sustained
+        // PC-Remote polling is starving the camera body's own AF-frame UI update.
+        private const val AF_BODY_SETTLE_QUIET_MS = 650L
         // How long we hold the UI in "reconnecting" after a USB detach before giving up.
         // Accommodates a bumped cable, a brief USB hub reset, or a camera auto-sleep wake.
         private const val RECONNECT_GRACE_MS = 7_000L
@@ -121,6 +126,7 @@ class UsbCameraConnectionManager(
     private var liveviewJob: Job? = null
     private var isLiveviewActive = false
     @Volatile private var postCaptureResumeDeadlineMs = 0L
+    @Volatile private var afLiveviewQuietUntilMs = 0L
 
     // Camera control and telemetry share one PTP transport. A telemetry request
     // can already be in flight when the user turns a dial; versioning lets us
@@ -377,7 +383,10 @@ class UsbCameraConnectionManager(
     private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
         if (controlEpoch == epoch) {
             controlWriteActive = false
-            telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
+            telemetryResumeAtMs = maxOf(
+                System.currentTimeMillis() + CONTROL_POLL_QUIET_MS,
+                afLiveviewQuietUntilMs
+            )
         }
     }
 
@@ -589,6 +598,16 @@ class UsbCameraConnectionManager(
 
             while (isActive && isLiveviewActive) {
                 try {
+                    // ILCE-7CM2 AF isolation: the user control is sent immediately,
+                    // but no NEW GetObject starts during the body-settle window.
+                    // Holding the last real frame is intentional; we never draw a
+                    // synthetic AF result.
+                    val afQuietRemainingMs = afLiveviewQuietUntilMs - System.currentTimeMillis()
+                    if (afQuietRemainingMs > 0L) {
+                        delay(minOf(5L, afQuietRemainingMs))
+                        continue
+                    }
+
                     // Do not start another GetObject while a user control is waiting.
                     // The PTP transaction already in flight is allowed to finish; then
                     // AF/exposure gets the bus before the next live-view frame.
@@ -638,6 +657,7 @@ class UsbCameraConnectionManager(
                         hasEverGottenFrame = true
                         pipeRecoveryAttempts = 0
                         postCaptureResumeDeadlineMs = 0L
+        afLiveviewQuietUntilMs = 0L
                         lastFrameTime = System.currentTimeMillis()
 
                         if (!monitorAfPostLiveViewPrepared) {
@@ -776,6 +796,12 @@ class UsbCameraConnectionManager(
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
         val requestedAtMs = System.currentTimeMillis()
+        // Start the quiet window at the actual AF request. Existing in-flight
+        // PTP work may finish, but the Live View producer will not launch another
+        // request. This changes only background load; D2E4 is not delayed.
+        if (ptpCamera?.deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true) {
+            afLiveviewQuietUntilMs = requestedAtMs + AF_BODY_SETTLE_QUIET_MS
+        }
         priorityControlIntents.incrementAndGet()
         return try {
             withContext(Dispatchers.IO) {
@@ -830,20 +856,15 @@ class UsbCameraConnectionManager(
                                         prepDebug = prepDebug
                                     )
                                 }
-                                val message = "AF RT(D2E4) x=$safeX y=$safeY\n" +
+                                val message = "AF RT(D2E4) QUIET x=$safeX y=$safeY\n" +
                                     "$prepDebug\n" +
-                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms wire+ack=${wireAndAckMs}ms ack=${ackMs}ms"
+                                    "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms wire+ack=${wireAndAckMs}ms ack=${ackMs}ms " +
+                                    "lvQuiet=${AF_BODY_SETTLE_QUIET_MS}ms"
                                 Log.d(TAG, message.replace('\n', ' '))
                                 _events.emit(CameraEvent.FocusDebug(message))
                                 _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-                                startRemoteTouchRuntimeProbe(
-                                    camera = camera,
-                                    generation = generation,
-                                    requestedAtMs = requestedAtMs,
-                                    ackAtMs = touchAckAtMs,
-                                    x = safeX,
-                                    y = safeY
-                                )
+                                // Previous E004/E005/D285 probe stayed static and its 0x9209
+                                // reads add camera load. Do not sample them in this isolation round.
                                 return@withLock CameraOperationResult.SuccessWithData(message)
                             }
                             Log.w(TAG, "Remote Touch failed (${PtpConstants.responseCodeName(touch.responseCode)}); using D2DC+S1 fallback")
