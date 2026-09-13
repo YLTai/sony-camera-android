@@ -57,14 +57,16 @@ jobs:
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Run unit tests and build Debug APK
-        run: ./gradlew :sonycamera:testDebugUnitTest :demo:assembleDebug --stacktrace
+        run: ./gradlew :sonycamera:testDebugUnitTest :demo:testDebugUnitTest :demo:assembleDebug --stacktrace
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sony-camera-test-reports
-          path: sonycamera/build/reports/tests/
+          path: |
+            sonycamera/build/reports/tests/
+            demo/build/reports/tests/
           if-no-files-found: ignore
 
       - name: Upload APK
