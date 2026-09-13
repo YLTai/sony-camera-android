@@ -22,6 +22,8 @@ android {
         }
     }
 
+    testOptions { unitTests.isReturnDefaultValues = true }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -37,6 +39,9 @@ android {
 }
 
 dependencies {
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation("junit:junit:4.13.2")
+
     implementation(project(":sonycamera"))
 
     implementation(libs.androidx.core.ktx)
