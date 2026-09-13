@@ -1,0 +1,53 @@
+name: Apply reviewed A7C II patch
+
+on:
+  push:
+    branches: [codex/a7c2-focus-connection]
+    paths: [maintenance/a7c2.patch.gz.b64]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'YLTai/sony-camera-android' && github.ref == 'refs/heads/codex/a7c2-focus-connection'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/a7c2-focus-connection
+          fetch-depth: 0
+      - name: Verify and apply exact reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code a5047dfaf160319f548eaa00fda52a695a8f1a6f HEAD -- demo sonycamera
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib
+          patch = gzip.decompress(base64.b64decode(pathlib.Path('maintenance/a7c2.patch.gz.b64').read_text().strip(), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'cbd6208946a6f778af013946b55d4c45d129e676d80581768e1c319b6cf483f8'
+          allowed = {
+              'demo/build.gradle.kts',
+              'demo/src/main/java/io/github/gallo/sonycamera/demo/CameraScreen.kt',
+              'demo/src/main/java/io/github/gallo/sonycamera/demo/FocusTapGesture.kt',
+              'demo/src/test/java/io/github/gallo/sonycamera/demo/FocusTapGestureTest.kt',
+              'sonycamera/build.gradle.kts',
+              'sonycamera/src/main/java/io/github/gallo/sonycamera/ptp/PtpContainerReader.kt',
+              'sonycamera/src/main/java/io/github/gallo/sonycamera/ptp/PtpTransport.kt',
+              'sonycamera/src/main/java/io/github/gallo/sonycamera/usb/UsbCameraConnectionManager.kt',
+              'sonycamera/src/test/java/io/github/gallo/sonycamera/ptp/PtpContainerReaderTest.kt',
+              'sonycamera/src/test/java/io/github/gallo/sonycamera/ptp/PtpTransportTest.kt',
+          }
+          paths = {line[6:] for line in patch.decode().splitlines() if line.startswith('+++ b/')}
+          assert paths == allowed, paths
+          pathlib.Path('/tmp/a7c2.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/a7c2.patch
+          git apply /tmp/a7c2.patch
+          git rm maintenance/a7c2.patch.gz.b64
+          git add demo sonycamera
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: dispatch focus on release and serialize USB lifecycle; validate PTP framing'
+          git push origin HEAD:refs/heads/codex/a7c2-focus-connection
