@@ -14,6 +14,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import io.github.gallo.sonycamera.CameraConnectionManager
 import io.github.gallo.sonycamera.CameraConnectionState
@@ -33,6 +34,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -114,12 +116,12 @@ class UsbCameraConnectionManager(
     override val liveviewFrames: SharedFlow<Bitmap> = _liveviewFrames
 
     // ── USB resources ──
-    private var usbDevice: UsbDevice? = null
+    @Volatile private var usbDevice: UsbDevice? = null
     private var usbConnection: UsbDeviceConnection? = null
     private var ptpInterface: UsbInterface? = null
-    private var ptpCamera: SonyPtpCamera? = null
+    @Volatile private var ptpCamera: SonyPtpCamera? = null
     private var liveviewJob: Job? = null
-    private var isLiveviewActive = false
+    @Volatile private var isLiveviewActive = false
     @Volatile private var postCaptureResumeDeadlineMs = 0L
 
     // Camera control and telemetry share one PTP transport. A telemetry request
@@ -135,9 +137,6 @@ class UsbCameraConnectionManager(
     private var afReleaseJob: Job? = null
     private var remoteTouchRuntimeProbeJob: Job? = null
     private var afGeneration = 0L
-    // ILCE-7CM2 diagnostic A/B: alternate the two camera-native wire actions
-    // in one session so body-LCD latency can be compared without S1 or fake UI.
-    private var afWireProbeD2dcNext = true
 
     private data class PendingAfFrameLatency(
         val generation: Long,
@@ -197,7 +196,7 @@ class UsbCameraConnectionManager(
 
     private fun observeAfFrameLatency(info: CameraFocusFrameInfo) {
         val pending = synchronized(afStateLock) { pendingAfFrameLatency } ?: return
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
 
         if (pending.firstGeometryChangeAtMs == null && focusGeometryChanged(pending.baseline, info)) {
             synchronized(afStateLock) {
@@ -311,9 +310,9 @@ class UsbCameraConnectionManager(
             // Let setAfPoint() unwind its control-write finally block first.
             delay(15)
             val deadlineMs = requestedAtMs + 900L
-            while (isActive && System.currentTimeMillis() < deadlineMs) {
+            while (isActive && SystemClock.elapsedRealtime() < deadlineMs) {
                 if (generation != afGeneration || ptpCamera !== camera) return@launch
-                val sampleAtMs = System.currentTimeMillis()
+                val sampleAtMs = SystemClock.elapsedRealtime()
                 val sample = camera.tryReadRemoteTouchRuntimeStatus(60)
                 if (sample == null) {
                     misses += 1
@@ -380,7 +379,7 @@ class UsbCameraConnectionManager(
     private fun endControlWrite(epoch: Long) = synchronized(controlEpochLock) {
         if (controlEpoch == epoch) {
             controlWriteActive = false
-            telemetryResumeAtMs = System.currentTimeMillis() + CONTROL_POLL_QUIET_MS
+            telemetryResumeAtMs = SystemClock.elapsedRealtime() + CONTROL_POLL_QUIET_MS
         }
     }
 
@@ -389,6 +388,10 @@ class UsbCameraConnectionManager(
     // finally-block cleanup instead of leaking a claimed interface.
     private var connectJob: Job? = null
     private var teardownJob: Job? = null
+    // Cancellation does not interrupt synchronous USB calls. Keep the entire
+    // attempt (including rollback) exclusive with every later attempt/teardown.
+    private val connectionLifecycleMutex = Mutex()
+    private var pendingPermissionDeviceName: String? = null
 
     // Reconnect bookkeeping. When the cable is physically detached we don't
     // immediately surface ConnectionLost — we hold the UI in "Connecting" for
@@ -409,10 +412,13 @@ class UsbCameraConnectionManager(
                 ACTION_USB_PERMISSION -> {
                     val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    if (granted && device != null) {
+                    if (device?.deviceName != pendingPermissionDeviceName ||
+                        pendingPermissionDeviceName == null
+                    ) return // Ignore late/duplicate grants after disconnect.
+                    pendingPermissionDeviceName = null
+                    if (granted && device != null && usbManager.hasPermission(device)) {
                         Log.d(TAG, "USB permission granted for ${device.deviceName}")
-                        connectJob?.cancel()
-                        connectJob = scope.launch { connectToDevice(device) }
+                        launchConnection(device)
                     } else {
                         Log.w(TAG, "USB permission denied")
                         _connectionState.value = CameraConnectionState.Error(
@@ -486,8 +492,8 @@ class UsbCameraConnectionManager(
             // receivers (and often skipped for manifest activity intent-filters
             // when the app is already foreground), so polling is the most
             // robust way to detect a re-plugged cable within the grace window.
-            val deadline = System.currentTimeMillis() + RECONNECT_GRACE_MS
-            while (isAwaitingReattach && System.currentTimeMillis() < deadline) {
+            val deadline = SystemClock.elapsedRealtime() + RECONNECT_GRACE_MS
+            while (isAwaitingReattach && SystemClock.elapsedRealtime() < deadline) {
                 val reattached = findSonyCamera()
                 if (reattached != null) {
                     Log.d(TAG, "Sony camera reattached (poll) — auto-reconnecting")
@@ -524,8 +530,8 @@ class UsbCameraConnectionManager(
         isAwaitingReattach = false
         reconnectTimeoutJob?.cancel()
         reconnectTimeoutJob = scope.launch {
-            val deadline = System.currentTimeMillis() + 1500
-            while (!usbManager.hasPermission(device) && System.currentTimeMillis() < deadline) {
+            val deadline = SystemClock.elapsedRealtime() + 1500
+            while (!usbManager.hasPermission(device) && SystemClock.elapsedRealtime() < deadline) {
                 delay(100)
             }
             if (usbManager.hasPermission(device)) {
@@ -555,7 +561,7 @@ class UsbCameraConnectionManager(
     // ══════════════════════════════════════════════
 
     override suspend fun startLiveview(): CameraOperationResult {
-        if (ptpCamera == null) return CameraOperationResult.Failure("Camera not connected")
+        val liveCamera = ptpCamera ?: return CameraOperationResult.Failure("Camera not connected")
         if (isLiveviewActive) return CameraOperationResult.Success
 
         isLiveviewActive = true
@@ -564,8 +570,8 @@ class UsbCameraConnectionManager(
 
             var frameCount = 0L
             var errorCount = 0L
-            var lastLogTime = System.currentTimeMillis()
-            var lastExposurePollTime = System.currentTimeMillis()
+            var lastLogTime = SystemClock.elapsedRealtime()
+            var lastExposurePollTime = SystemClock.elapsedRealtime()
             var lastSettingsPollTime = lastExposurePollTime
             var consecutiveErrors = 0
             var hasEverGottenFrame = false
@@ -577,7 +583,7 @@ class UsbCameraConnectionManager(
             // denials in a row. Normal Sony behavior during zoom / AF bursts
             // is to produce denials between frames; counting them as a stall
             // made the FPS collapse exactly when the camera was busy.
-            var lastFrameTime = System.currentTimeMillis()
+            var lastFrameTime = SystemClock.elapsedRealtime()
             val stallTimeoutMs = 2_000L
             val initStallTimeoutMs = 5_000L
             // Wedged-liveview watchdog: after a reconnect, the camera can
@@ -586,11 +592,11 @@ class UsbCameraConnectionManager(
             // unplug does. After NEVER seeing a first frame for this many
             // milliseconds, give up and surface ConnectionLost so the UI
             // can prompt the user to unplug/replug.
-            val postCaptureResume = System.currentTimeMillis() < postCaptureResumeDeadlineMs
+            val postCaptureResume = SystemClock.elapsedRealtime() < postCaptureResumeDeadlineMs
             val neverGotFrameFatalMs = if (postCaptureResume) 18_000L else 10_000L
-            val liveviewStartTime = System.currentTimeMillis()
+            val liveviewStartTime = SystemClock.elapsedRealtime()
 
-            while (isActive && isLiveviewActive) {
+            while (isActive && isLiveviewActive && ptpCamera === liveCamera) {
                 try {
                     // Do not start another GetObject while a user control is waiting.
                     // The PTP transaction already in flight is allowed to finish; then
@@ -599,8 +605,10 @@ class UsbCameraConnectionManager(
                         delay(2)
                         continue
                     }
-                    val frameStart = System.currentTimeMillis()
-                    val liveFrame = ptpCamera?.getLiveViewFrameData()
+                    val frameStart = SystemClock.elapsedRealtime()
+                    val liveFrame = liveCamera.getLiveViewFrameData()
+                    ensureActive()
+                    if (ptpCamera !== liveCamera) break
                     val jpeg = liveFrame?.jpeg
 
                     if (jpeg != null) {
@@ -641,7 +649,7 @@ class UsbCameraConnectionManager(
                         hasEverGottenFrame = true
                         pipeRecoveryAttempts = 0
                         postCaptureResumeDeadlineMs = 0L
-                        lastFrameTime = System.currentTimeMillis()
+                        lastFrameTime = SystemClock.elapsedRealtime()
 
                         if (!monitorAfPostLiveViewPrepared) {
                             monitorAfPostLiveViewPrepared = true
@@ -669,7 +677,7 @@ class UsbCameraConnectionManager(
                         // snapshots immediately after the first frame, and never stack exposure +
                         // settings reads in the same frame iteration. App-originated writes already
                         // publish their result immediately; these polls are only for camera-side dials.
-                        val telemetryNow = System.currentTimeMillis()
+                        val telemetryNow = SystemClock.elapsedRealtime()
                         if (priorityControlIntents.get() == 0 && !controlWriteActive &&
                             telemetryNow - liveviewStartTime >= TELEMETRY_WARMUP_MS &&
                             telemetryNow >= telemetryResumeAtMs
@@ -679,7 +687,7 @@ class UsbCameraConnectionManager(
                                 val pollEpoch = controlEpoch
                                 val settings = ptpCamera?.readCameraSettingsState()
                                 if (settings != null && pollEpoch == controlEpoch &&
-                                    System.currentTimeMillis() >= telemetryResumeAtMs
+                                    SystemClock.elapsedRealtime() >= telemetryResumeAtMs
                                 ) {
                                     _events.emit(CameraEvent.CameraSettingsUpdated(settings))
                                 } else if (settings != null) {
@@ -690,7 +698,7 @@ class UsbCameraConnectionManager(
                                 val pollEpoch = controlEpoch
                                 val exposure = ptpCamera?.readExposureState()
                                 if (exposure != null && pollEpoch == controlEpoch &&
-                                    System.currentTimeMillis() >= telemetryResumeAtMs
+                                    SystemClock.elapsedRealtime() >= telemetryResumeAtMs
                                 ) {
                                     _events.emit(CameraEvent.ExposureUpdated(exposure))
                                 } else if (exposure != null) {
@@ -700,7 +708,7 @@ class UsbCameraConnectionManager(
                         }
 
                         // Pace: ensure minimum interval between successful frames
-                        val elapsed = System.currentTimeMillis() - frameStart
+                        val elapsed = SystemClock.elapsedRealtime() - frameStart
                         val sleepMs = maxOf(
                             LIVEVIEW_MIN_FRAME_INTERVAL_MS - elapsed,
                             LIVEVIEW_CONTROL_GAP_MS
@@ -716,7 +724,7 @@ class UsbCameraConnectionManager(
                         // swipe-away → reconnect sequences. Only a physical
                         // unplug clears it; surface ConnectionLost so the
                         // user is prompted to do that.
-                        val sinceStart = System.currentTimeMillis() - liveviewStartTime
+                        val sinceStart = SystemClock.elapsedRealtime() - liveviewStartTime
                         if (!hasEverGottenFrame && sinceStart > neverGotFrameFatalMs) {
                             Log.e(TAG, "Liveview never produced a frame in ${sinceStart}ms; keeping the established PC Remote session")
                             isLiveviewActive = false
@@ -728,7 +736,7 @@ class UsbCameraConnectionManager(
                             break
                         }
 
-                        val timeSinceFrame = System.currentTimeMillis() - lastFrameTime
+                        val timeSinceFrame = SystemClock.elapsedRealtime() - lastFrameTime
                         val stallThreshold = if (hasEverGottenFrame) stallTimeoutMs else initStallTimeoutMs
                         if (timeSinceFrame > stallThreshold) {
                             pipeRecoveryAttempts++
@@ -736,7 +744,7 @@ class UsbCameraConnectionManager(
                                     "clearing endpoints (recovery attempt $pipeRecoveryAttempts)")
                             ptpCamera?.flushAndResetPipe()
                             delay(200)
-                            lastFrameTime = System.currentTimeMillis()
+                            lastFrameTime = SystemClock.elapsedRealtime()
                             consecutiveErrors = 0
                         }
 
@@ -746,7 +754,7 @@ class UsbCameraConnectionManager(
                     }
 
                     // Log stats every 5 seconds
-                    val now = System.currentTimeMillis()
+                    val now = SystemClock.elapsedRealtime()
                     if (now - lastLogTime >= 5000) {
                         val elapsed = (now - lastLogTime) / 1000.0
                         val fps = frameCount / elapsed
@@ -772,28 +780,38 @@ class UsbCameraConnectionManager(
 
     override suspend fun stopLiveview(): CameraOperationResult {
         isLiveviewActive = false
-        liveviewJob?.cancel()
-        liveviewJob = null
+        val stoppedJob = liveviewJob
+        stoppedJob?.cancelAndJoin()
+        if (liveviewJob === stoppedJob) liveviewJob = null
         return CameraOperationResult.Success
     }
 
     override suspend fun setAfPoint(x: Int, y: Int): CameraOperationResult {
-        val requestedAtMs = System.currentTimeMillis()
+        val requestedCamera = ptpCamera ?: return CameraOperationResult.Failure("Camera not connected")
+        val requestedAtMs = SystemClock.elapsedRealtime()
         priorityControlIntents.incrementAndGet()
         return try {
             withContext(Dispatchers.IO) {
                 controlWriteMutex.withLock {
                     val camera = ptpCamera
                         ?: return@withLock CameraOperationResult.Failure("Camera not connected")
+                    if (camera !== requestedCamera) {
+                        return@withLock CameraOperationResult.Failure("Camera connection changed")
+                    }
                     val safeX = x.coerceIn(0, 639)
                     val safeY = y.coerceIn(0, 479)
                     val epoch = beginControlWrite()
                     try {
-                        val commandStartedMs = System.currentTimeMillis()
+                        val commandStartedMs = SystemClock.elapsedRealtime()
                         val dispatchWaitMs = commandStartedMs - requestedAtMs
-                        val prepStartedMs = System.currentTimeMillis()
+                        val prepStartedMs = SystemClock.elapsedRealtime()
                         val prepDebug = camera.prepareMonitorTapAf()
-                        val prepMs = System.currentTimeMillis() - prepStartedMs
+                        val prepMs = SystemClock.elapsedRealtime() - prepStartedMs
+                        ensureActive()
+                        if (ptpCamera !== camera) {
+                            return@withLock CameraOperationResult.Failure("Camera connection changed")
+                        }
+                        synchronized(afStateLock) { pendingAfFrameLatency = null }
 
                         afReleaseJob?.cancel()
                         afReleaseJob = null
@@ -807,60 +825,14 @@ class UsbCameraConnectionManager(
                         }
 
                         val baseline = latestFocusFrameInfo
-                        val a7c2WireProbe = camera.deviceName?.contains("ILCE-7CM2", ignoreCase = true) == true
-
-                        // Controlled same-session A/B test. A uses only AF Area Position
-                        // (D2DC): no S1, no Remote Touch, no Live View pause. Sony's own
-                        // RemoteSampleApp documents AF Area Position as the direct focus-frame
-                        // center move. The next tap uses B (D2E4), then alternates again.
-                        if (a7c2WireProbe && afWireProbeD2dcNext) {
-                            afWireProbeD2dcNext = false
-                            val moveStartedMs = System.currentTimeMillis()
-                            val move = camera.moveAfAreaPosition(safeX, safeY)
-                            val moveAckAtMs = System.currentTimeMillis()
-                            val wireAndAckMs = (moveAckAtMs - moveStartedMs - move.queueWaitMs).coerceAtLeast(0L)
-                            val ackMs = moveAckAtMs - requestedAtMs
-                            if (!move.isSuccess) {
-                                synchronized(afStateLock) { pendingAfFrameLatency = null }
-                                val message = "AF A D2DC-ONLY FAIL x=$safeX y=$safeY\n$prepDebug\n" +
-                                    "D2DC=${PtpConstants.responseCodeName(move.responseCode)} ack=${ackMs}ms next=B"
-                                _events.emit(CameraEvent.FocusDebug(message))
-                                return@withLock CameraOperationResult.Failure(message)
-                            }
-                            synchronized(afStateLock) {
-                                pendingAfFrameLatency = PendingAfFrameLatency(
-                                    generation = generation,
-                                    x = safeX,
-                                    y = safeY,
-                                    requestedAtMs = requestedAtMs,
-                                    ackAtMs = moveAckAtMs,
-                                    commandDoneAtMs = moveAckAtMs,
-                                    path = "A:D2DC-only",
-                                    s1Ms = null,
-                                    baseline = baseline,
-                                    prepDebug = prepDebug
-                                )
-                            }
-                            val message = "AF A D2DC-ONLY x=$safeX y=$safeY\n" +
-                                "$prepDebug\n" +
-                                "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${move.queueWaitMs}ms " +
-                                "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1 next=B"
-                            Log.d(TAG, message.replace('\n', ' '))
-                            _events.emit(CameraEvent.FocusDebug(message))
-                            _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-                            return@withLock CameraOperationResult.SuccessWithData(message)
-                        }
-                        if (a7c2WireProbe) afWireProbeD2dcNext = true
-
-                        // B path: Sony RemoteTouchOperation (D2E4), also without S1.
-                        // a7C II fast path: RemoteTouchOperation (D2E4). The previous
-                        // D2DC-only isolation proved tap -> returned focus geometry -> Compose
-                        // is ~0.14 s, so restore the real Remote Touch path and observe Sony's
-                        // own E004/E005/D285 runtime states after the command instead.
+                        // A monitor tap is an action, not a protocol A/B test.
+                        // Prefer the camera-advertised Remote Touch capability on
+                        // every tap. D2DC alone only moves the area; the fallback
+                        // below also presses S1 when Remote Touch is unavailable.
                         if (camera.supportsRemoteTouch()) {
-                            val touchStartedMs = System.currentTimeMillis()
+                            val touchStartedMs = SystemClock.elapsedRealtime()
                             val touch = camera.executeRemoteTouch(safeX, safeY)
-                            val touchAckAtMs = System.currentTimeMillis()
+                            val touchAckAtMs = SystemClock.elapsedRealtime()
                             val wireAndAckMs = (touchAckAtMs - touchStartedMs - touch.queueWaitMs).coerceAtLeast(0L)
                             val ackMs = touchAckAtMs - requestedAtMs
                             if (touch.isSuccess) {
@@ -872,34 +844,42 @@ class UsbCameraConnectionManager(
                                         requestedAtMs = requestedAtMs,
                                         ackAtMs = touchAckAtMs,
                                         commandDoneAtMs = touchAckAtMs,
-                                        path = if (a7c2WireProbe) "B:RT(D2E4)" else "RT(D2E4)",
+                                        path = "RT(D2E4)",
                                         s1Ms = null,
                                         baseline = baseline,
                                         prepDebug = prepDebug
                                     )
                                 }
-                                val message = (if (a7c2WireProbe) "AF B RT(D2E4)" else "AF RT(D2E4)") +
-                                    " x=$safeX y=$safeY\n" +
+                                val message = "AF RT(D2E4) x=$safeX y=$safeY\n" +
                                     "$prepDebug\n" +
                                     "dispatch=${dispatchWaitMs}ms prep=${prepMs}ms bus=${touch.queueWaitMs}ms " +
-                                    "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1" +
-                                    if (a7c2WireProbe) " next=A" else ""
+                                    "wire+ack=${wireAndAckMs}ms ack=${ackMs}ms NO-S1"
                                 Log.d(TAG, message.replace('\n', ' '))
-                                _events.emit(CameraEvent.FocusDebug(message))
-                                _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
-                                // Previous E004/E005/D285 probe stayed static and its 0x9209
-                                // reads add camera load. Do not sample them in this isolation round.
+                                _events.tryEmit(CameraEvent.FocusDebug(message))
+                                _events.tryEmit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                                // Keep optional runtime-property diagnostics off the
+                                // latency-critical path; they add camera-side work.
                                 return@withLock CameraOperationResult.SuccessWithData(message)
                             }
-                            Log.w(TAG, "Remote Touch failed (${PtpConstants.responseCodeName(touch.responseCode)}); using D2DC+S1 fallback")
+                            // A timeout/DeviceBusy reply does not prove the action
+                            // was rejected. Do not send a second, different AF action
+                            // while the original may still be executing on the body.
+                            if (touch.responseCode != PtpConstants.RESP_OPERATION_NOT_SUPPORTED &&
+                                touch.responseCode != PtpConstants.RESP_PARAMETER_NOT_SUPPORTED
+                            ) {
+                                val message = "Remote Touch failed: ${PtpConstants.responseCodeName(touch.responseCode)}"
+                                _events.tryEmit(CameraEvent.FocusDebug(message))
+                                return@withLock CameraOperationResult.Failure(message)
+                            }
+                            Log.w(TAG, "Remote Touch unsupported; using D2DC+S1 fallback")
                         }
 
                         // Compatibility fallback: move AF Area Position first, then
                         // explicitly press S1. This remains available if Remote Touch
                         // is not exposed/enabled by the connected body.
-                        val moveStartedMs = System.currentTimeMillis()
+                        val moveStartedMs = SystemClock.elapsedRealtime()
                         val move = camera.moveAfAreaPosition(safeX, safeY)
-                        val ackAtMs = System.currentTimeMillis()
+                        val ackAtMs = SystemClock.elapsedRealtime()
                         val wireAndAckMs = (ackAtMs - moveStartedMs - move.queueWaitMs).coerceAtLeast(0L)
                         val ackMs = ackAtMs - requestedAtMs
 
@@ -907,13 +887,13 @@ class UsbCameraConnectionManager(
                             synchronized(afStateLock) { pendingAfFrameLatency = null }
                             val message = "AF D2DC FAIL x=$safeX y=$safeY\n$prepDebug\n" +
                                 "D2DC=${PtpConstants.responseCodeName(move.responseCode)} ack=${ackMs}ms"
-                            _events.emit(CameraEvent.FocusDebug(message))
+                            _events.tryEmit(CameraEvent.FocusDebug(message))
                             return@withLock CameraOperationResult.Failure(message)
                         }
 
-                        val s1StartedMs = System.currentTimeMillis()
+                        val s1StartedMs = SystemClock.elapsedRealtime()
                         val pressResult = camera.setAutofocusPressed(true)
-                        val s1AckAtMs = System.currentTimeMillis()
+                        val s1AckAtMs = SystemClock.elapsedRealtime()
                         val s1Ms = s1AckAtMs - s1StartedMs
                         afHalfPressHeld = pressResult.isSuccess
 
@@ -921,7 +901,7 @@ class UsbCameraConnectionManager(
                             synchronized(afStateLock) { pendingAfFrameLatency = null }
                             val message = "AF D2DC+S1 FAIL x=$safeX y=$safeY\n$prepDebug\n" +
                                 "moveAck=${ackMs}ms s1=${s1Ms}ms ${PtpConstants.responseCodeName(pressResult.responseCode)}"
-                            _events.emit(CameraEvent.FocusDebug(message))
+                            _events.tryEmit(CameraEvent.FocusDebug(message))
                             return@withLock CameraOperationResult.Failure(message)
                         }
 
@@ -944,14 +924,16 @@ class UsbCameraConnectionManager(
                             "$prepDebug\n" +
                             "moveAck=${ackMs}ms s1=${s1Ms}ms bus=${move.queueWaitMs}ms wire+ack=${wireAndAckMs}ms"
                         Log.d(TAG, message.replace('\n', ' '))
-                        _events.emit(CameraEvent.FocusDebug(message))
-                        _events.emit(CameraEvent.AfTargetUpdated(safeX, safeY))
+                        _events.tryEmit(CameraEvent.FocusDebug(message))
+                        _events.tryEmit(CameraEvent.AfTargetUpdated(safeX, safeY))
                         scheduleAutofocusRelease(camera, generation)
                         CameraOperationResult.SuccessWithData(message)
+                    } catch (cancel: kotlinx.coroutines.CancellationException) {
+                        throw cancel
                     } catch (e: Exception) {
                         Log.e(TAG, "AF target command failed", e)
                         val message = "AF TARGET exception: ${e.message ?: e.javaClass.simpleName}"
-                        _events.emit(CameraEvent.FocusDebug(message))
+                        _events.tryEmit(CameraEvent.FocusDebug(message))
                         CameraOperationResult.Failure(message)
                     } finally {
                         endControlWrite(epoch)
@@ -1143,7 +1125,7 @@ class UsbCameraConnectionManager(
                     val idle = withContext(Dispatchers.IO) { camera.waitForCaptureIdle(3_500L) }
                     Log.d(TAG, "Post-capture queue idle=$idle; restarting liveview")
                     delay(if (idle) 250L else 700L)
-                    postCaptureResumeDeadlineMs = System.currentTimeMillis() + 18_000L
+                    postCaptureResumeDeadlineMs = SystemClock.elapsedRealtime() + 18_000L
                     startLiveview()
                 }
             }
@@ -1210,24 +1192,25 @@ class UsbCameraConnectionManager(
      */
     private fun closeUsbResources() {
         isLiveviewActive = false
-        afWireProbeD2dcNext = true
-        liveviewJob?.cancel()
+        val previousLiveview = liveviewJob
+        previousLiveview?.cancel()
         liveviewJob = null
         afReleaseJob?.cancel()
         afReleaseJob = null
         remoteTouchRuntimeProbeJob?.cancel()
         remoteTouchRuntimeProbeJob = null
-        afHalfPressHeld = false
         synchronized(afStateLock) { pendingAfFrameLatency = null }
         latestFocusFrameInfo = null
         controlWriteActive = false
-        priorityControlIntents.set(0)
+        // In-flight controls still decrement in finally. Resetting this counter
+        // here would make it negative and break priority after a reconnect.
 
         // Cancel any in-flight connect so its finally-block unwinds the
         // resources it allocated rather than silently committing them after
         // we've already decided to tear down.
         connectJob?.cancel()
         connectJob = null
+        pendingPermissionDeviceName = null
 
         val camera = ptpCamera
         val conn = usbConnection
@@ -1245,25 +1228,45 @@ class UsbCameraConnectionManager(
         // Run the teardown on a scope that survives engine.destroy()'s
         // scope.cancel — otherwise endSession can be cancelled before its
         // USB transactions reach the camera.
+        val previousTeardown = teardownJob
         teardownJob = teardownScope.launch {
-            Log.d(TAG, "USB teardown: ending camera session")
-            try {
-                // Graceful end: release Sony priority + PTP CloseSession so
-                // the camera knows we're done and returns to normal operation.
-                camera?.endSession()
-            } catch (e: Exception) {
-                Log.w(TAG, "endSession during teardown: ${e.message}")
+            previousTeardown?.join()
+            previousLiveview?.join()
+            connectionLifecycleMutex.withLock {
+                controlWriteMutex.withLock {
+                    endUsbSession(camera, conn, iface)
+                }
             }
-            try {
-                if (iface != null) conn?.releaseInterface(iface)
-            } catch (e: Exception) {
-                Log.w(TAG, "releaseInterface during teardown: ${e.message}")
-            }
-            try {
-                conn?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "connection close during teardown: ${e.message}")
-            }
+        }
+    }
+
+    private fun endUsbSession(
+        camera: SonyPtpCamera?,
+        conn: UsbDeviceConnection?,
+        iface: UsbInterface?
+    ) {
+        Log.d(TAG, "USB teardown: ending camera session")
+        try {
+            if (afHalfPressHeld) camera?.setAutofocusPressed(false)
+        } catch (e: Exception) {
+            Log.w(TAG, "S1 release during teardown: ${e.message}")
+        } finally {
+            afHalfPressHeld = false
+        }
+        try {
+            camera?.endSession()
+        } catch (e: Exception) {
+            Log.w(TAG, "endSession during teardown: ${e.message}")
+        }
+        try {
+            if (iface != null) conn?.releaseInterface(iface)
+        } catch (e: Exception) {
+            Log.w(TAG, "releaseInterface during teardown: ${e.message}")
+        }
+        try {
+            conn?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "connection close during teardown: ${e.message}")
         }
     }
 
@@ -1286,6 +1289,12 @@ class UsbCameraConnectionManager(
      * Connect to a Sony camera. Requests USB permission if needed.
      */
     fun connectToCamera(device: UsbDevice? = null) {
+        scope.launch(Dispatchers.Main.immediate) { requestConnection(device) }
+    }
+
+    private fun requestConnection(device: UsbDevice?) {
+        if (connectJob?.isActive == true || pendingPermissionDeviceName != null) return
+        if (ptpCamera != null && _connectionState.value is CameraConnectionState.Ready) return
         val target = device ?: findSonyCamera()
         if (target == null) {
             _connectionState.value = CameraConnectionState.Error(
@@ -1297,9 +1306,9 @@ class UsbCameraConnectionManager(
         _connectionState.value = CameraConnectionState.Connecting
 
         if (usbManager.hasPermission(target)) {
-            connectJob?.cancel()
-            connectJob = scope.launch { connectToDevice(target) }
+            launchConnection(target)
         } else {
+            pendingPermissionDeviceName = target.deviceName
             Log.d(TAG, "Requesting USB permission for ${target.deviceName}")
             // Explicit intent required on Android 14+ (targeting U+)
             val intent = Intent(ACTION_USB_PERMISSION).apply {
@@ -1318,6 +1327,20 @@ class UsbCameraConnectionManager(
         }
     }
 
+    private fun launchConnection(device: UsbDevice) {
+        if (connectJob?.isActive == true || ptpCamera != null) return
+        val previousTeardown = teardownJob
+        connectJob = scope.launch {
+            // Never proceed after an arbitrary join timeout: old CloseSession
+            // would otherwise close the new session. USB I/O is itself bounded.
+            previousTeardown?.join()
+            connectionLifecycleMutex.withLock {
+                ensureActive()
+                connectToDevice(device)
+            }
+        }
+    }
+
     /**
      * Internal: connect to a USB device after permission is granted.
      *
@@ -1332,22 +1355,12 @@ class UsbCameraConnectionManager(
         var localIface: UsbInterface? = null
         var ifaceClaimed = false
         var localCamera: SonyPtpCamera? = null
+        var sessionOpened = false
+        var sonyInitStarted = false
         var committed = false
 
         try {
             _connectionState.value = CameraConnectionState.Connecting
-
-            // A previous user disconnect may still be finishing its final
-            // CloseSession on another UsbDeviceConnection. Give it a short,
-            // bounded chance to finish so old teardown commands cannot land in
-            // the middle of this new session.
-            teardownJob?.let { previousTeardown ->
-                if (previousTeardown.isActive) {
-                    Log.d(TAG, "Waiting briefly for previous USB teardown")
-                    kotlinx.coroutines.withTimeoutOrNull(1800) { previousTeardown.join() }
-                }
-            }
-            teardownJob = null
 
             // Log all device interfaces for debugging
             Log.d(TAG, "USB Device: vendor=0x${device.vendorId.toString(16)}, product=0x${device.productId.toString(16)}, class=${device.deviceClass}")
@@ -1389,8 +1402,9 @@ class UsbCameraConnectionManager(
                     break
                 }
                 Log.w(TAG, "Failed to claim interface, attempt $attempt/3, retrying...")
-                Thread.sleep(500)
+                if (attempt < 3) delay(500)
             }
+            ensureActive()
             if (!ifaceClaimed) {
                 _connectionState.value = CameraConnectionState.Error(
                     "Another app is using the camera. Close other photo apps, unplug the cable, and try again."
@@ -1429,12 +1443,15 @@ class UsbCameraConnectionManager(
             val transport = PtpTransport(localConn, bulkOut, bulkIn, interruptIn)
             localCamera = SonyPtpCamera(transport)
 
+            ensureActive()
             if (!localCamera.openSession()) {
+                ensureActive()
                 // One bounded recovery only after a genuine OpenSession failure,
                 // matching mature PTP clients. No close/reopen loop and no 7.5s
                 // blind General-Error sleeps.
                 Log.w(TAG, "Initial OpenSession failed — attempting one PTP Device Reset recovery")
                 transport.recoverAfterFailedOpenSession(localIface.id)
+                ensureActive()
                 localCamera = SonyPtpCamera(transport)
                 if (!localCamera.openSession()) {
                     _connectionState.value = CameraConnectionState.Error(
@@ -1444,6 +1461,8 @@ class UsbCameraConnectionManager(
                 }
             }
 
+            sessionOpened = true
+            ensureActive()
             if (!localCamera.getDeviceInfo()) {
                 Log.w(TAG, "Could not get device info, continuing with generic Sony identity")
             }
@@ -1454,10 +1473,13 @@ class UsbCameraConnectionManager(
             // not recycle a valid session merely because the first live-view object
             // is late; that speculative reopen path was a major source of long
             // "Camera Initializing" stalls on the a7C II.
-            val handshakeStarted = System.currentTimeMillis()
+            ensureActive()
+            val handshakeStarted = SystemClock.elapsedRealtime()
+            sonyInitStarted = true
             val remoteReady = localCamera.initSonyExtension()
             Log.d(TAG, "Sony SDIO handshake completed=${remoteReady} in " +
-                    "${System.currentTimeMillis() - handshakeStarted}ms")
+                    "${SystemClock.elapsedRealtime() - handshakeStarted}ms")
+            ensureActive()
             if (!remoteReady) {
                 _connectionState.value = CameraConnectionState.Error(
                     "Sony PC Remote handshake failed. Close other camera-control apps, verify PC Remote USB mode, then reconnect."
@@ -1465,21 +1487,21 @@ class UsbCameraConnectionManager(
                 return@withContext
             }
 
-            usbDevice = device
-            usbConnection = localConn
-            ptpInterface = localIface
-            ptpCamera = localCamera
-            committed = true
+            val readyCamera = checkNotNull(localCamera)
+            withContext(Dispatchers.Main.immediate) {
+                ensureActive()
+                usbDevice = device
+                usbConnection = localConn
+                ptpInterface = localIface
+                ptpCamera = readyCamera
+                committed = true
 
-            _cameraName.value = localCamera.deviceName ?: "Sony a7C II (USB)"
-            Log.d(TAG, "USB camera connected: ${localCamera.deviceName}; starting liveview separately")
-            _connectionState.value = CameraConnectionState.Ready
-            _events.emit(CameraEvent.FocusDebug("AF READY | ${localCamera.monitorAfDebug()}"))
-
-            // Live view is a post-connect operation, matching Sony's sample/API
-            // model. The UI can now distinguish a connected camera waiting for
-            // frames from a camera still stuck in the handshake.
-            startLiveview()
+                _cameraName.value = readyCamera.deviceName ?: "Sony camera (USB)"
+                Log.d(TAG, "USB camera connected: ${readyCamera.deviceName}; starting liveview separately")
+                _connectionState.value = CameraConnectionState.Ready
+                _events.tryEmit(CameraEvent.FocusDebug("AF READY | ${readyCamera.monitorAfDebug()}"))
+                startLiveview()
+            }
         } catch (cancel: kotlinx.coroutines.CancellationException) {
             // Caller (disconnect / detach) is tearing us down. Don't flip to Error —
             // let the cleanup path already in flight set the authoritative state.
@@ -1494,7 +1516,11 @@ class UsbCameraConnectionManager(
             // Release anything we opened if we didn't fully commit. Safe to call
             // on null refs / already-closed handles — each wrapped in try/catch.
             if (!committed) {
-                try { localCamera?.closeSession() } catch (e: Exception) { Log.w(TAG, "closeSession rollback: ${e.message}") }
+                try {
+                    if (sessionOpened) {
+                        if (sonyInitStarted) localCamera?.endSession() else localCamera?.closeSession()
+                    }
+                } catch (e: Exception) { Log.w(TAG, "session rollback: ${e.message}") }
                 if (ifaceClaimed && localIface != null && localConn != null) {
                     try { localConn.releaseInterface(localIface) } catch (e: Exception) { Log.w(TAG, "releaseInterface rollback: ${e.message}") }
                 }

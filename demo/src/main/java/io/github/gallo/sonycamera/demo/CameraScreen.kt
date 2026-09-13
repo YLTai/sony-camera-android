@@ -312,14 +312,17 @@ fun CameraScreen(camera: CameraConnectionClient) {
                 queuedAfPoint = targetX to targetY
                 if (afRequestJob?.isActive == true) return
                 afRequestJob = scope.launch {
-                    while (true) {
-                        val target = queuedAfPoint ?: break
-                        queuedAfPoint = null
-                        afBusy = true
-                        val result = camera.setAfPoint(target.first, target.second)
-                        if (result is CameraOperationResult.Failure) lastError = result.message
+                    try {
+                        while (true) {
+                            val target = queuedAfPoint ?: break
+                            queuedAfPoint = null
+                            afBusy = true
+                            val result = camera.setAfPoint(target.first, target.second)
+                            if (result is CameraOperationResult.Failure) lastError = result.message
+                        }
+                    } finally {
+                        afBusy = false
                     }
-                    afBusy = false
                 }
             }
 
@@ -626,12 +629,21 @@ private fun PreviewPane(
                             if (next == 1f) Offset(0.5f, 0.5f) else mapped
                         )
                     },
-                    onTap = { tap ->
-                        val mapped = mapTapToImage(
-                            tap, containerSize, bitmap.width, bitmap.height,
-                            magnification, latestMagnifyPivot.value
-                        ) ?: return@detectTapGestures
-                        onAfPoint((mapped.x * 639f).toInt(), (mapped.y * 479f).toInt())
+                    // onTap waits for the double-tap timeout when onDoubleTap is
+                    // installed. Dispatch on a successful release instead, before
+                    // that timeout. Drag/cancel must never issue a focus command.
+                    // A double tap can focus as well as magnify: the first tap
+                    // cannot both be immediate and know whether another will follow.
+                    onPress = { press ->
+                        focusOnSuccessfulRelease(press) { tap ->
+                            val mapped = mapTapToImage(
+                                tap, containerSize, bitmap.width, bitmap.height,
+                                magnification, latestMagnifyPivot.value
+                            )
+                            if (mapped != null) {
+                                onAfPoint((mapped.x * 639f).toInt(), (mapped.y * 479f).toInt())
+                            }
+                        }
                     }
                 )
             }

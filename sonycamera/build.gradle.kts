@@ -18,6 +18,8 @@ android {
         }
     }
 
+    testOptions { unitTests.isReturnDefaultValues = true }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -35,6 +37,9 @@ android {
 }
 
 dependencies {
+    testImplementation("org.mockito:mockito-core:5.14.2")
+    testImplementation("junit:junit:4.13.2")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.annotation)
     implementation(libs.kotlinx.coroutines.core)
